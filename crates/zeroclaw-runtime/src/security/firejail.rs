@@ -28,6 +28,9 @@ const CONFLICTING_EXTRA_ARGS: &[&str] = &[
     "--join-or-start",
     "--join-network",
     "--join-filesystem",
+    // Chroot mode clears Firejail's `--noroot` and skips the private home
+    // setup, so it would undo the wrapper's `--noroot` and `--private=home`.
+    "--chroot",
 ];
 
 /// Prefix of the Firejail options that re-expose host devices or the host
@@ -675,6 +678,26 @@ mod tests {
                 "{bad:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn firejail_rejects_chroot_because_it_disables_noroot_and_private_home() {
+        for bad in ["--chroot", "--chroot=/srv/firejail-root"] {
+            let error =
+                FirejailSandbox::validate_extra_args(&["--net=none".to_string(), bad.to_string()])
+                    .expect_err(bad);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+            assert!(error.to_string().contains("--chroot"), "{bad:?}: {error}");
+        }
+        // Dotted hardening options are still accepted alongside other extras.
+        assert_eq!(
+            FirejailSandbox::validate_extra_args(&[
+                "--net=none".to_string(),
+                "--seccomp.block-secondary".to_string(),
+            ])
+            .unwrap(),
+            ["--net=none", "--seccomp.block-secondary"]
+        );
     }
 
     #[test]
