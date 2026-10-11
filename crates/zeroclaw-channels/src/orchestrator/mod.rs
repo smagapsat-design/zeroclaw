@@ -4345,8 +4345,9 @@ fn last_turn_opening_user_index(history: &[ChatMessage]) -> Option<usize> {
 
 /// Project the current turn's complete exchange and delivered final response
 /// before selecting the assistant/tool rows retained by channels. Text-result
-/// carriers supply host sensitivity provenance but are not persisted as user
-/// turns. The provider's working history remains unchanged.
+/// carriers supply host sensitivity provenance, but selection still starts
+/// after the last user-role row as it did before prompt attachments. The
+/// provider's working history remains unchanged.
 fn retained_current_turn_messages(
     history: &[ChatMessage],
     final_response: &str,
@@ -4354,9 +4355,19 @@ fn retained_current_turn_messages(
     session_prompts_enabled: bool,
 ) -> Vec<ChatMessage> {
     let mut delta = Vec::new();
+    let mut retention_start = 0;
     if keep_tool_context {
         let last_user_idx = last_turn_opening_user_index(history).unwrap_or(0);
         let tail = history.get(last_user_idx + 1..).unwrap_or_default();
+        // Redaction needs the full exchange to associate host-marked results
+        // with their calls. Retention is a separate policy: preserve upstream
+        // selection after the last user-role row, including text-result
+        // carriers, rather than retaining calls whose results are discarded.
+        retention_start = history
+            .iter()
+            .rposition(|message| message.role == "user")
+            .unwrap_or(0)
+            .saturating_sub(last_user_idx);
         // The loop's final assistant is replaced by the delivered response.
         let end = if tail.last().is_some_and(|m| m.role == "assistant") {
             tail.len() - 1
@@ -4371,6 +4382,7 @@ fn retained_current_turn_messages(
         session_prompts_enabled,
     )
     .into_iter()
+    .skip(retention_start)
     .filter(|message| message.role == "assistant" || message.role == "tool")
     .collect()
 }
@@ -23602,12 +23614,11 @@ api_key = "anthropic-key"
                 "[Task failed — not continuing this request]"
             );
         } else {
-            assert_eq!(retained.len(), 4);
-            assert!(retained[1..3].iter().all(|m| {
-                m.role == "assistant"
-                    && m.content
-                        .contains("[Session-prompt tool exchange omitted from export]")
-            }));
+            // Preserve upstream selection after the last synthetic user result:
+            // text-tool exchanges are provider context, not retained transcript rows.
+            assert_eq!(retained.len(), 2);
+            assert_eq!(retained[1].role, "assistant");
+            assert_eq!(retained[1].content, "Session context saved and listed.");
         }
         let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
         let hydrated = hydrate_session_transcript(&reopened, &key)
@@ -55503,6 +55514,26 @@ Done."#;
     // ── Tests tool context preservation ──────────────
 
     #[test]
+    fn retained_current_turn_messages_preserves_base_text_protocol_selection() {
+        let history = vec![
+            ChatMessage::system("system context"),
+            ChatMessage::user("read status"),
+            ChatMessage::assistant(
+                r#"<tool_call>{"name":"shell","arguments":{"command":"status"}}</tool_call>"#,
+            ),
+            ChatMessage::user("[Tool results]\n<tool_result>ready</tool_result>"),
+            ChatMessage::assistant("loop answer"),
+        ];
+        for enabled in [false, true] {
+            let retained = retained_current_turn_messages(&history, "ready", true, enabled);
+            assert_eq!(
+                message_pairs(&retained),
+                vec![("assistant".into(), "ready".into())]
+            );
+        }
+    }
+
+    #[test]
     fn retained_current_turn_messages_returns_intermediate_messages() {
         let history = vec![
             ChatMessage::system("sys"),
@@ -55593,7 +55624,7 @@ Done."#;
     }
 
     #[test]
-    fn channel_session_prompt_retention_feature_off_preserves_unmarked_and_masks_host_marked() {
+    fn channel_session_prompt_retention_feature_off_omits_text_exchanges() {
         let marked = sensitive_text_exchange();
         for result in [
             marked[1].clone(),
@@ -55602,13 +55633,7 @@ Done."#;
             )),
         ] {
             let retained = retained_tool_exchange_for_test(&[marked[0].clone(), result], false);
-            assert_eq!(retained.len(), 1);
-            assert_eq!(retained[0].role, "assistant");
-            assert!(
-                retained[0]
-                    .content
-                    .contains("[Session-prompt tool exchange omitted from export]")
-            );
+            assert!(retained.is_empty());
         }
 
         let unmarked = vec![
@@ -55620,9 +55645,8 @@ Done."#;
         history.push(ChatMessage::assistant("loop response"));
         let prose = "session_prompt_set is disabled";
         let retained = retained_current_turn_messages(&history, prose, true, false);
-        assert_eq!(retained.len(), 2);
-        assert_eq!(retained[0].content, marked[0].content);
-        assert_eq!(retained[1].content, prose);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, prose);
     }
 
     #[test]

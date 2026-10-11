@@ -117,6 +117,9 @@ impl Deref for GatewayCancellationRegistry {
 }
 
 impl DerefMut for GatewayCancellationRegistry {
+    // Direct mutation remains available for map-compatible consumers and
+    // fixtures. Turn admission must use `register_cancel_token`: raw insertion
+    // bypasses the pending-deletion latch and replacement cancellation checks.
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.tokens
     }
