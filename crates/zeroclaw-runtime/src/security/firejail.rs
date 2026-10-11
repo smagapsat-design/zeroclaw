@@ -30,6 +30,12 @@ const CONFLICTING_EXTRA_ARGS: &[&str] = &[
     "--join-filesystem",
 ];
 
+/// Prefix of the Firejail options that re-expose host devices or the host
+/// `/dev/shm` "even with `--private-dev`" (`--keep-dev-shm`,
+/// `--keep-dev-ntsync`, `--keep-dev-tpm`, ...). The wrapper always passes
+/// `--private-dev`, so any of these would weaken its device baseline.
+const PRIVATE_DEV_OVERRIDE_PREFIX: &str = "--keep-dev-";
+
 /// Firejail sandbox backend for Linux
 #[derive(Debug, Clone, Default)]
 pub struct FirejailSandbox {
@@ -83,7 +89,9 @@ impl FirejailSandbox {
                         &[("arg", &quoted)],
                     ));
                 }
-                if CONFLICTING_EXTRA_ARGS.contains(&name) {
+                if CONFLICTING_EXTRA_ARGS.contains(&name)
+                    || name.starts_with(PRIVATE_DEV_OVERRIDE_PREFIX)
+                {
                     return Err(invalid(
                         "cli-security-firejail-args-error-conflict",
                         &[("name", name)],
@@ -94,14 +102,19 @@ impl FirejailSandbox {
             .collect()
     }
 
-    /// `--name` where `name` is non-empty and made of the characters Firejail
-    /// option names use; a value may only follow after `=`.
+    /// `--name` where `name` is one or more dot-separated segments (as in
+    /// `--seccomp.block-secondary` or `--caps.drop`), each starting with an
+    /// ASCII letter or digit and made of the characters Firejail option names
+    /// use; a value may only follow after `=`. This is only the name grammar:
+    /// conflicts with the wrapper are checked separately.
     fn is_option_name(name: &str) -> bool {
         name.strip_prefix("--").is_some_and(|rest| {
-            rest.starts_with(|c: char| c.is_ascii_alphanumeric())
-                && rest
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            rest.split('.').all(|segment| {
+                segment.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    && segment
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            })
         })
     }
 
@@ -661,6 +674,87 @@ mod tests {
                 error.to_string().contains("firejail_args"),
                 "{bad:?}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn firejail_rejects_args_that_reexpose_host_devices_despite_private_dev() {
+        for bad in [
+            "--keep-dev-shm",
+            "--keep-dev-ntsync",
+            "--keep-dev-tpm",
+            "--keep-dev-shm=yes",
+        ] {
+            let error =
+                FirejailSandbox::validate_extra_args(&["--net=none".to_string(), bad.to_string()])
+                    .expect_err(bad);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+            assert!(
+                error.to_string().contains("--keep-dev-"),
+                "{bad:?}: {error}"
+            );
+        }
+        // An independent restriction is still accepted on its own.
+        assert_eq!(
+            FirejailSandbox::validate_extra_args(&["--net=none".to_string()]).unwrap(),
+            ["--net=none"]
+        );
+    }
+
+    #[test]
+    fn firejail_accepts_dotted_options_and_passes_them_before_the_wrapped_command() {
+        let sandbox = FirejailSandbox {
+            extra_args: FirejailSandbox::validate_extra_args(&[
+                "--seccomp.block-secondary".to_string(),
+                "--net=none".to_string(),
+            ])
+            .unwrap(),
+        };
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("payload");
+        sandbox
+            .wrap_command_with_support(
+                &mut cmd,
+                FirejailHardeningSupport {
+                    seccomp: true,
+                    caps_drop: true,
+                    noroot: true,
+                },
+            )
+            .unwrap();
+
+        let args = args(&cmd);
+        let at = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing from {args:?}"))
+        };
+        assert!(
+            at("--seccomp") < at("--seccomp.block-secondary"),
+            "the wrapper's own --seccomp stays, extras follow it: {args:?}"
+        );
+        assert_eq!(
+            at("--seccomp.block-secondary") + 1,
+            at("--net=none"),
+            "in configured order: {args:?}"
+        );
+        assert!(
+            at("--net=none") < at("payload"),
+            "Firejail options, not arguments of the wrapped command: {args:?}"
+        );
+    }
+
+    #[test]
+    fn firejail_rejects_malformed_dotted_option_names() {
+        for bad in [
+            "--seccomp.",
+            "--.seccomp",
+            "--seccomp..block-secondary",
+            "--seccomp.-block",
+            "--seccomp. block",
+        ] {
+            let error = FirejailSandbox::validate_extra_args(&[bad.to_string()]).expect_err(bad);
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
         }
     }
 
