@@ -3099,6 +3099,37 @@ impl TelegramChannel {
                                 skip = e.delivered;
                                 last_sent_at = Some(std::time::Instant::now());
                             }
+                            // Telegram is flood-limiting this chat: neither
+                            // another narration attempt nor the final-answer
+                            // send below may go out inside `retry_after`. The
+                            // accepted narration chunks stay posted (never
+                            // resent); the final answer was not delivered, so
+                            // report it as undelivered and not to be resent.
+                            if e.rate_limited {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "error": format!("{}", e.source),
+                                            "chunks_delivered": skip,
+                                        })
+                                    ),
+                                    "Telegram flood limit during multi-message pending narration; not sending more narration or the final answer"
+                                );
+                                return Err(zeroclaw_api::channel::FinalizeUndelivered {
+                                    reason: format!(
+                                        "flood-limited while delivering pending narration \
+                                         ({skip} chunk(s) accepted): {:#}",
+                                        e.source
+                                    ),
+                                }
+                                .into());
+                            }
                             attempt += 1;
                             if attempt >= MULTI_MESSAGE_FINALIZE_RETRIES {
                                 ::zeroclaw_log::record!(
@@ -24593,5 +24624,99 @@ mod tests {
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "no resume inside the penalty window");
+    }
+
+    /// Regression: a long flood limit hit while `finalize_draft` (multi-message
+    /// mode) delivers pending narration must stop the whole finalization: no
+    /// further narration attempt and no final-answer send inside `retry_after`,
+    /// reported as `FinalizeUndelivered` so the orchestrator does not resend.
+    /// `accepted_narration_chunks` covers both the zero-prefix case and a
+    /// partially accepted narration prefix, which must be posted exactly once.
+    async fn assert_finalize_stops_on_narration_flood_limit(accepted_narration_chunks: usize) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mut narration = "N".repeat(3000);
+        narration.push_str(&"M".repeat(6000));
+        let chunks = split_message_for_telegram(narration.trim());
+        assert!(chunks.len() >= 2, "narration fixture must span two chunks");
+
+        let mock_server = MockServer::start().await;
+        if accepted_narration_chunks > 0 {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/sendMessage$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ))
+                .up_to_n_times(accepted_narration_chunks as u64)
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(536))
+            .mount(&mock_server)
+            .await;
+
+        let ch =
+            multi_message_test_channel("telegram_test_alias", 0).with_api_base(mock_server.uri());
+        let recipient = "100:7";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut state = MultiDraftState::new(Some("7".into()));
+            state.latest_visible = narration.clone();
+            drafts.insert(
+                TelegramChannel::multi_draft_key(recipient, &draft_id),
+                state,
+            );
+        }
+
+        let final_answer = "Distinct final answer text, unrelated to the narration.";
+        let err = ch
+            .finalize_draft(recipient, &draft_id, final_answer, true)
+            .await
+            .expect_err("a flood-limited finalize must not report success");
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "must report a no-resend undelivered finalization, got: {err:#}"
+        );
+
+        let bodies: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            accepted_narration_chunks + 1,
+            "no request after the flood-limited one; final answer sent: {}",
+            bodies.iter().any(|b| b.contains(final_answer))
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains(final_answer)),
+            "the final answer must not be sent inside the flood penalty"
+        );
+        for chunk in &chunks[..accepted_narration_chunks] {
+            let posts = bodies.iter().filter(|b| b.contains(chunk.as_str())).count();
+            assert_eq!(
+                posts, 1,
+                "an accepted narration chunk is posted exactly once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_multi_message_stops_on_narration_flood_limit() {
+        assert_finalize_stops_on_narration_flood_limit(0).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_draft_multi_message_stops_on_narration_flood_limit_after_accepted_prefix() {
+        assert_finalize_stops_on_narration_flood_limit(1).await;
     }
 }
