@@ -88,12 +88,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub use zeroclaw_infra::gateway_session::GatewayCancellationRegistry;
 use zeroclaw_infra::gateway_session::GatewaySessionCoordination;
 pub(crate) use zeroclaw_infra::gateway_session::{
     GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key, register_cancel_token,
     remove_cancel_token_if_current,
 };
+pub use zeroclaw_infra::gateway_session::{GatewayCancellationEntry, GatewayCancellationRegistry};
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -8312,7 +8312,7 @@ path = "{trigger_path}"
                     .lock()
                     .expect("cancel_tokens lock poisoned")
                     .get(session_key)
-                    .map(|(_, token)| Arc::clone(token))
+                    .map(|entry| Arc::clone(&entry.token))
                 {
                     return token;
                 }
@@ -8335,7 +8335,7 @@ path = "{trigger_path}"
                     .lock()
                     .expect("cancel_tokens lock poisoned")
                     .get(session_key)
-                    .map(|(_, token)| Arc::clone(token))
+                    .map(|entry| Arc::clone(&entry.token))
                     && !Arc::ptr_eq(&token, previous)
                 {
                     return token;
@@ -8359,7 +8359,7 @@ path = "{trigger_path}"
                     .lock()
                     .expect("cancel_tokens lock poisoned")
                     .get(session_key)
-                    .is_some_and(|(_, current)| Arc::ptr_eq(current, expected));
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.token, expected));
                 if matches {
                     return;
                 }
@@ -8875,7 +8875,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-abort")
-            .map(|(_, token)| Arc::clone(token));
+            .map(|entry| Arc::clone(&entry.token));
         assert!(
             token.is_some(),
             "streamed webhook turn must register its cancellation token"
@@ -8973,7 +8973,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-drop")
-            .map(|(_, token)| Arc::clone(token))
+            .map(|entry| Arc::clone(&entry.token))
             .expect("streamed turn must register its cancellation token");
 
         drop(response);
@@ -9024,7 +9024,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-replace")
-            .map(|(_, token)| Arc::clone(token))
+            .map(|entry| Arc::clone(&entry.token))
             .expect("first streamed turn must register its cancellation token");
 
         let (headers, body) = request();
@@ -9041,7 +9041,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-replace")
-            .map(|(_, token)| Arc::clone(token))
+            .map(|entry| Arc::clone(&entry.token))
             .expect("replacement streamed turn must register its cancellation token");
 
         tokio::time::timeout(Duration::from_secs(1), first_token.cancelled())
@@ -9053,7 +9053,7 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel_tokens lock poisoned")
             .get("gw_sse-replace")
-            .map(|(_, token)| Arc::clone(token))
+            .map(|entry| Arc::clone(&entry.token))
             .expect("old-turn cleanup must preserve the replacement token");
         assert!(Arc::ptr_eq(&current, &second_token));
 
@@ -9509,9 +9509,9 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel registry lock")
             .get("gw_cross_direction")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("replacement SSE token remains registered");
-        assert!(Arc::ptr_eq(&current.1, &sse_token));
+        assert!(Arc::ptr_eq(&current, &sse_token));
         assert!(!sse_token.is_cancelled());
     }
 
@@ -9542,9 +9542,9 @@ data: [DONE]\n\n";
             .lock()
             .expect("cancel registry lock")
             .get("gw_cross_direction")
-            .cloned()
+            .map(|entry| Arc::clone(&entry.token))
             .expect("replacement WS token remains registered");
-        assert!(Arc::ptr_eq(&current.1, &ws_token));
+        assert!(Arc::ptr_eq(&current, &ws_token));
         assert!(!ws_token.is_cancelled());
     }
 

@@ -90,12 +90,26 @@ pub fn gateway_cancel_key(session_id: &str) -> String {
 /// race without letting a stale delete affect a successor generation.
 #[derive(Default)]
 pub struct GatewayCancellationRegistry {
-    tokens: HashMap<String, (u64, Arc<tokio_util::sync::CancellationToken>)>,
+    tokens: HashMap<String, GatewayCancellationEntry>,
     pending_deletions: HashMap<String, HashSet<u64>>,
 }
 
+/// The queue incarnation bound to one registered gateway turn.
+///
+/// The caller's admitted queue key is canonical: it cannot be reconstructed
+/// from the cancellation lookup key because persistence normalization is lossy
+/// and WebSocket and HTTP transports use different queue-key conventions.
+pub struct GatewayCancellationEntry {
+    /// Exact queue key supplied at turn registration.
+    pub session_key: String,
+    /// Lifecycle generation of that queue at registration.
+    pub generation: u64,
+    /// Cancellation authority for this registered turn.
+    pub token: Arc<tokio_util::sync::CancellationToken>,
+}
+
 impl Deref for GatewayCancellationRegistry {
-    type Target = HashMap<String, (u64, Arc<tokio_util::sync::CancellationToken>)>;
+    type Target = HashMap<String, GatewayCancellationEntry>;
 
     fn deref(&self) -> &Self::Target {
         &self.tokens
@@ -133,9 +147,13 @@ pub fn register_cancel_token(
             .is_some_and(|generations| generations.contains(&session_generation));
         let previous = registry.insert(
             cancel_key.to_owned(),
-            (session_generation, Arc::clone(&cancel_token)),
+            GatewayCancellationEntry {
+                session_key: session_key.to_owned(),
+                generation: session_generation,
+                token: Arc::clone(&cancel_token),
+            },
         );
-        (previous.map(|(_, token)| token), pending_delete)
+        (previous.map(|entry| entry.token), pending_delete)
     };
     if let Some(previous_token) = previous_token {
         previous_token.cancel();
@@ -156,7 +174,7 @@ pub fn remove_cancel_token_if_current(
     let mut tokens = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
     if tokens
         .get(cancel_key)
-        .is_some_and(|(_, current)| Arc::ptr_eq(current, cancel_token))
+        .is_some_and(|entry| Arc::ptr_eq(&entry.token, cancel_token))
     {
         tokens.remove(cancel_key);
     }
@@ -208,18 +226,9 @@ pub fn signal_deletion_at_generation(
 ) -> GatewayDeletionCancellation {
     let mut cancellations = registry.lock().unwrap_or_else(|error| error.into_inner());
     let mut cancelled_active_turn = false;
-    for (cancel_key, (generation, token)) in cancellations.tokens.iter() {
-        let canonical_key = gateway_session_key(
-            cancel_key
-                .strip_prefix(GW_SESSION_PREFIX)
-                .unwrap_or(cancel_key),
-        );
-        // Preserve exact legacy dotted keys as well as the current sanitized
-        // persistence key. Both may identify the raw active turn being reset.
-        if (cancel_key == session_key || canonical_key == session_key)
-            && *generation == expected_generation
-        {
-            token.cancel();
+    for entry in cancellations.tokens.values() {
+        if entry.session_key == session_key && entry.generation == expected_generation {
+            entry.token.cancel();
             cancelled_active_turn = true;
         }
     }
@@ -252,6 +261,92 @@ pub fn signal_deletion_at_generation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deletion_does_not_cancel_a_distinct_dotted_queue() {
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let dotted = Arc::new(tokio_util::sync::CancellationToken::new());
+        let underscored = Arc::new(tokio_util::sync::CancellationToken::new());
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team.alpha",
+            "gw_team.alpha",
+            0,
+            Arc::clone(&dotted),
+        );
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team_alpha",
+            "gw_team_alpha",
+            0,
+            Arc::clone(&underscored),
+        );
+
+        let deletion = coordination.signal_deletion_at_generation("gw_team_alpha", 0);
+        assert!(deletion.cancelled_active_turn);
+        assert!(underscored.is_cancelled());
+        assert!(
+            !dotted.is_cancelled(),
+            "a distinct admitted queue must survive"
+        );
+    }
+
+    #[test]
+    fn deletion_matches_the_registered_queue_not_the_cancel_lookup_key() {
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        // HTTP/SSE uses the normalized queue but the raw abort lookup key.
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team.alpha",
+            "gw_team_alpha",
+            0,
+            Arc::clone(&token),
+        );
+        let unrelated = coordination.signal_deletion_at_generation("gw_team.alpha", 0);
+        assert!(!unrelated.cancelled_active_turn);
+        assert!(!token.is_cancelled());
+        let owning = coordination.signal_deletion_at_generation("gw_team_alpha", 0);
+        assert!(owning.cancelled_active_turn);
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn a_distinct_active_queue_does_not_suppress_pending_deletion() {
+        let coordination = GatewaySessionCoordination::for_gateway();
+        let dotted = Arc::new(tokio_util::sync::CancellationToken::new());
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team.alpha",
+            "gw_team.alpha",
+            0,
+            Arc::clone(&dotted),
+        );
+        let deletion = coordination.signal_deletion_at_generation("gw_team_alpha", 0);
+        assert!(!deletion.cancelled_active_turn);
+        let underscored = Arc::new(tokio_util::sync::CancellationToken::new());
+        register_cancel_token(
+            coordination.cancellations(),
+            "gw_team_alpha",
+            "gw_team_alpha",
+            0,
+            Arc::clone(&underscored),
+        );
+        assert!(
+            underscored.is_cancelled(),
+            "late registration must consume its latch"
+        );
+        assert!(!dotted.is_cancelled());
+        drop(deletion);
+        assert!(
+            coordination
+                .cancellations()
+                .lock()
+                .unwrap()
+                .pending_deletions()
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn gateway_coordination_preserves_depth_eight() {

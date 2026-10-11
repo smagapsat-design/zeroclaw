@@ -2293,7 +2293,7 @@ pub async fn handle_api_session_abort(
         let token = cancel_key.as_deref().and_then(|key| {
             tokens
                 .get(key)
-                .map(|(_, token)| std::sync::Arc::clone(token))
+                .map(|entry| std::sync::Arc::clone(&entry.token))
         });
         (cancel_key, token)
     };
@@ -3945,7 +3945,11 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 session_key.to_string(),
-                (successor_generation, Arc::new(successor_token.clone())),
+                crate::GatewayCancellationEntry {
+                    session_key: session_key.to_string(),
+                    generation: successor_generation,
+                    token: Arc::new(successor_token.clone()),
+                },
             );
 
         let stale =
@@ -4139,7 +4143,14 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(session_key.clone(), (0, std::sync::Arc::new(token.clone())));
+            .insert(
+                session_key.clone(),
+                crate::GatewayCancellationEntry {
+                    session_key: session_key.clone(),
+                    generation: 0,
+                    token: Arc::new(token.clone()),
+                },
+            );
 
         // Same id GET /api/sessions advertises as session_key for abort.
         let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
@@ -4165,7 +4176,11 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_operator-1".to_string(),
-                (0, std::sync::Arc::new(token.clone())),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_operator-1".to_string(),
+                    generation: 0,
+                    token: Arc::new(token.clone()),
+                },
             );
 
         let response = handle_api_session_abort(
@@ -4192,7 +4207,11 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team_alpha".to_string(),
-                (0, std::sync::Arc::new(token.clone())),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_team_alpha".to_string(),
+                    generation: 0,
+                    token: Arc::new(token.clone()),
+                },
             );
 
         // List contract: session_id=team_alpha, session_key=gw_team_alpha.
@@ -4224,7 +4243,11 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team.alpha".to_string(),
-                (0, std::sync::Arc::new(token.clone())),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_team.alpha".to_string(),
+                    generation: 0,
+                    token: Arc::new(token.clone()),
+                },
             );
 
         let response = handle_api_session_abort(
@@ -4251,7 +4274,11 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team.alpha".to_string(),
-                (0, std::sync::Arc::new(token.clone())),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_team.alpha".to_string(),
+                    generation: 0,
+                    token: Arc::new(token.clone()),
+                },
             );
 
         let response = handle_api_session_abort(
@@ -4279,7 +4306,11 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team.alpha".to_string(),
-                (0, std::sync::Arc::new(dotted_token.clone())),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_team.alpha".to_string(),
+                    generation: 0,
+                    token: Arc::new(dotted_token.clone()),
+                },
             );
         state
             .cancel_tokens
@@ -4287,7 +4318,11 @@ pub(crate) mod tests {
             .expect("cancel_tokens lock")
             .insert(
                 "gw_team_alpha".to_string(),
-                (0, std::sync::Arc::new(underscored_token.clone())),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_team_alpha".to_string(),
+                    generation: 0,
+                    token: Arc::new(underscored_token.clone()),
+                },
             );
 
         let dotted_response = handle_api_session_abort(
@@ -4343,7 +4378,14 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_team.alpha".to_string(), (0, Arc::new(token.clone())));
+            .insert(
+                "gw_team.alpha".to_string(),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_team.alpha".to_string(),
+                    generation: 0,
+                    token: Arc::new(token.clone()),
+                },
+            );
 
         let response = handle_api_session_delete(
             State(state),
@@ -4387,7 +4429,14 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_team.alpha".to_string(), (0, Arc::new(token.clone())));
+            .insert(
+                "gw_team.alpha".to_string(),
+                crate::GatewayCancellationEntry {
+                    session_key: "gw_team_alpha".to_string(),
+                    generation: 0,
+                    token: Arc::new(token.clone()),
+                },
+            );
 
         let response = handle_api_session_delete(
             State(state),
@@ -4403,6 +4452,44 @@ pub(crate) mod tests {
             "deletion must cancel the raw dotted turn even when persistence is sanitized"
         );
         assert!(!backend.session_exists("gw_team_alpha"));
+    }
+
+    #[tokio::test]
+    async fn session_delete_preserves_a_distinct_dotted_session_and_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        for key in ["gw_team.alpha", "gw_team_alpha"] {
+            backend
+                .append(key, &zeroclaw_providers::ChatMessage::assistant("existing"))
+                .unwrap();
+        }
+        let state = test_state_with_session_backend(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&backend),
+        );
+        let dotted = Arc::new(tokio_util::sync::CancellationToken::new());
+        let underscored = Arc::new(tokio_util::sync::CancellationToken::new());
+        for (key, token) in [
+            ("gw_team.alpha", Arc::clone(&dotted)),
+            ("gw_team_alpha", Arc::clone(&underscored)),
+        ] {
+            crate::register_cancel_token(&state.cancel_tokens, key, key, 0, token);
+        }
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(underscored.is_cancelled());
+        assert!(!dotted.is_cancelled());
+        assert!(!backend.session_exists("gw_team_alpha"));
+        assert!(backend.session_exists("gw_team.alpha"));
+        assert_eq!(backend.load("gw_team.alpha").len(), 1);
     }
 
     #[tokio::test]
