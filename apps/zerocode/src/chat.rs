@@ -8378,7 +8378,7 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
             .line_count(estimated_inner_width)
             .max(1) as u16;
         let content_height = Paragraph::new(text.as_str())
-            .wrap(Wrap { trim: true })
+            .wrap(Wrap { trim: false })
             .line_count(estimated_inner_width) as u16;
         let desired_height = content_height
             .saturating_add(estimated_footer_height)
@@ -8441,7 +8441,7 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .split(inner);
     let body_area = body_and_footer[0];
     let max_scroll = Paragraph::new(text.clone())
-        .wrap(Wrap { trim: true })
+        .wrap(Wrap { trim: false })
         .line_count(body_area.width.max(1))
         .saturating_sub(body_area.height as usize) as u16;
     // Rendering establishes the authoritative viewport bound for the current
@@ -8454,7 +8454,8 @@ fn render_approval_overlay(f: &mut Frame, state: &mut ChatState, area: Rect) {
     f.render_widget(
         Paragraph::new(text)
             .style(fill)
-            .wrap(Wrap { trim: true })
+            // Retain leading spaces after normal word-wrap boundary handling.
+            .wrap(Wrap { trim: false })
             .scroll((scroll_offset, 0)),
         body_area,
     );
@@ -26627,6 +26628,36 @@ mod tests {
             0,
             "scrolling above the first exact detail must clamp to its start"
         );
+    }
+
+    #[test]
+    fn strict_approval_overlay_preserves_spaces_at_soft_wraps() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let area = Rect::new(0, 0, 60, 30);
+        // The strict body is 58 columns wide here. Keep a short word after
+        // enough spaces to leave indentation after the normal wrap separator.
+        let summary = format!("{}    b", "a".repeat(56));
+        let mut s = state();
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".into(),
+            request_id: "strict-spaces".into(),
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: summary,
+            timeout_secs: 30,
+            allow_always: false,
+        });
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        terminal
+            .draw(|frame| render_approval_overlay(frame, &mut s, area))
+            .expect("spaced overlay");
+        let buffer = terminal.backend().buffer();
+        let b_row = (0..area.height)
+            .find(|&y| (1..area.width - 1).any(|x| buffer[(x, y)].symbol() == "b"))
+            .expect("wrapped word");
+        assert_eq!(buffer[(1, b_row)].symbol(), " ");
+        assert_eq!(buffer[(2, b_row)].symbol(), "b");
     }
 
     #[test]
