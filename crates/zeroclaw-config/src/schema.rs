@@ -23934,6 +23934,333 @@ impl Config {
         }
     }
 
+    /// Validate one configured agent without requiring unrelated agents to be complete.
+    pub fn validate_agent(&self, alias: &str) -> Result<()> {
+        let Some(agent) = self.agents.get(alias) else {
+            validation_bail!(
+                DanglingReference,
+                format!("agents.{alias}"),
+                "agents.{alias} is not configured",
+            );
+        };
+
+        // model_provider: mandatory, dotted `<type>.<inner>` ref into
+        // model_providers.<type>.<inner>.
+        let mp = agent.model_provider.trim();
+        if mp.is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("agents.{alias}.model_provider"),
+                "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
+            );
+        }
+        match mp.split_once('.') {
+            Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                if !crate::providers::ModelProviders::slot_names().contains(&ty) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
+                    );
+                }
+                let exists = self
+                    .get_map_keys(&format!("providers.models.{ty}"))
+                    .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.model_provider"),
+                        "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
+                    );
+                }
+            }
+            _ => validation_bail!(
+                InvalidFormat,
+                format!("agents.{alias}.model_provider"),
+                "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
+            ),
+        }
+
+        // channels: each entry is a dotted `<type>.<inner>` ref into
+        // channels.<type>.<inner>. Empty list is valid (delegate-only agent).
+        // Uses the schema-derived `get_map_keys` so new channel types
+        // surface here automatically — no per-type match arm.
+        for (i, ch) in agent.channels.iter().enumerate() {
+            let trimmed = ch.trim();
+            match trimmed.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    // `get_map_keys` stores section names using the raw
+                    // field ident (snake), the same dotted form the
+                    // operator sees in TOML (`gmail_push`, `voice_call`,
+                    // `nextcloud_talk`). Look up verbatim.
+                    let exists = self
+                        .get_map_keys(&format!("channels.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.channels[{i}]"),
+                            "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.channels[{i}]"),
+                    "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
+                ),
+            }
+        }
+
+        // Per-agent provider refs that resolve into the typed provider
+        // sections. Empty = no preference for that category (no TTS / no
+        // STT for this agent), which is valid. Non-empty values must
+        // match a configured `[providers.<category>.<type>.<alias>]`
+        // entry, fail loud with the dangling ref otherwise.
+        // there is no global default-X-provider concept — every consumer
+        // either picks a configured alias or opts out entirely.
+        let typed_provider_refs: &[(&str, &str, &str)] = &[
+            ("providers.tts", "tts_provider", agent.tts_provider.trim()),
+            (
+                "providers.transcription",
+                "transcription_provider",
+                agent.transcription_provider.trim(),
+            ),
+            // New field:
+            (
+                "providers.models",
+                "classifier_provider",
+                agent.classifier_provider.trim(),
+            ),
+            // Agent-level context-compression summarizer override.
+            (
+                "providers.models",
+                "summary_provider",
+                agent.summary_provider.trim(),
+            ),
+        ];
+        for (section_prefix, field, value) in typed_provider_refs {
+            if value.is_empty() {
+                continue;
+            }
+            match value.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("{section_prefix}.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.{field}"),
+                            "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.{field}"),
+                    "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
+                ),
+            }
+        }
+
+        // Bare-alias bundle refs. Tuple is (kebab section path, kebab
+        // agent field name, value list). Both names use the schema's
+        // kebab form: section name matches what `get_map_keys` expects
+        // (macro converts snake→kebab via `snake_to_kebab` per
+        // crates/zeroclaw-macros/src/lib.rs:1056); field name matches
+        // what `prop_fields()` emits, so DanglingReference paths bind
+        // directly to the right inline error in the dashboard form.
+        let bare_multi: &[(&str, &str, &[String])] = &[
+            ("skill_bundles", "skill_bundles", &agent.skill_bundles),
+            (
+                "knowledge_bundles",
+                "knowledge_bundles",
+                &agent.knowledge_bundles,
+            ),
+            ("mcp_bundles", "mcp_bundles", &agent.mcp_bundles),
+        ];
+        for (section, field, values) in bare_multi {
+            for (i, key) in values.iter().enumerate() {
+                let trimmed = key.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let exists = self
+                    .get_map_keys(section)
+                    .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.{field}[{i}]"),
+                        "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
+                    );
+                }
+            }
+        }
+        let bare_single: &[(&str, &str, &str)] = &[
+            ("risk_profiles", "risk_profile", agent.risk_profile.as_str()),
+            (
+                "runtime_profiles",
+                "runtime_profile",
+                agent.runtime_profile.as_str(),
+            ),
+        ];
+        for (section, field, raw) in bare_single {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let exists = self
+                .get_map_keys(section)
+                .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
+            if !exists {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.{field}"),
+                    "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
+                );
+            }
+        }
+
+        // risk_profile is mandatory for enabled agents — there is no
+        // global fallback, so an enabled agent with no profile can't
+        // gate its actions. Run this check last so the more specific
+        // dangling/format errors above surface first.
+        if agent.enabled && agent.risk_profile.trim().is_empty() {
+            validation_bail!(
+                RequiredFieldEmpty,
+                format!("agents.{alias}.risk_profile"),
+                "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
+            );
+        }
+
+        // delegates: explicit roster entries must point at OTHER
+        // configured agents, never self. Cross-profile targets are
+        // permitted (they run under the target's own policy), so no
+        // profile match is required here.
+        let mut seen_delegates: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for (i, target) in agent.delegates.iter().enumerate() {
+            let target_str = target.agent().trim();
+            if target_str.is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent is empty; remove it or name a configured agent",
+                );
+            }
+            if target_str == alias {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent = {target_str:?} names this agent itself; an agent cannot delegate to itself",
+                );
+            }
+            if !self.agents.contains_key(target_str) {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
+                );
+            }
+            if !seen_delegates.insert(target_str) {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.delegates[{i}].agent"),
+                    "agents.{alias}.delegates[{i}].agent = {target_str:?} duplicates an earlier delegate target",
+                );
+            }
+        }
+
+        // workspace.access: keys must point at OTHER agents, never
+        // self, and every target must be a configured agent.
+        for (target, mode) in &agent.workspace.access {
+            let target_str = target.as_str();
+            if target_str == alias {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.access.{target_str}"),
+                    "agents.{alias}.workspace.access.{target_str} = {mode:?} but {target_str} is this agent itself; an agent always has full access to its own workspace, so self-references in the cross-agent allowlist are not permitted",
+                );
+            }
+            if !self.agents.contains_key(target_str) {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.workspace.access.{target_str}"),
+                    "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
+                );
+            }
+        }
+
+        // workspace.read_memory_from: every grant must name a configured
+        // agent, use the same MemoryBackendKind as the declaring agent,
+        // and appear at most once. Legacy string grants are unrestricted;
+        // structured grants may carry an exact category allowlist. An
+        // explicitly empty category list is invalid rather than silently
+        // becoming unrestricted. Mismatched backends fail at config load
+        // rather than producing a runtime error when the per-agent memory
+        // plumbing consumes the allowlist.
+        let agent_backend = agent.memory.backend;
+        let mut seen_memory_grants: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
+            let target_str = target.as_str();
+            if target
+                .categories()
+                .is_some_and(|categories| categories.is_empty())
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                    "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
+                );
+            }
+            if !seen_memory_grants.insert(target_str) {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                    "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
+                );
+            }
+            if target_str == alias {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own memory rows, so self-references in the cross-agent allowlist are not permitted",
+                );
+            }
+            let Some(target_agent) = self.agents.get(target_str) else {
+                validation_bail!(
+                    DanglingReference,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
+                );
+            };
+            if target.categories().is_some()
+                && matches!(
+                    agent_backend,
+                    crate::multi_agent::MemoryBackendKind::Markdown
+                )
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
+                );
+            }
+            if target_agent.memory.backend != agent_backend {
+                let target_backend = target_agent.memory.backend;
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                    "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -25280,329 +25607,12 @@ impl Config {
             }
         }
 
-        // Per-agent validation. Mandatory + alias-existence checks live
-        // here so the gateway PATCH path returns structured per-field
-        // errors and the frontend never owns this rule. Sorted iteration
-        // keeps error ordering stable across runs.
+        // Per-agent validation. Sorted iteration keeps whole-config error
+        // ordering stable, while `validate_agent` also supports scoped editors.
         let mut agent_aliases: Vec<&String> = self.agents.keys().collect();
         agent_aliases.sort();
         for alias in agent_aliases {
-            let agent = &self.agents[alias];
-
-            // model_provider: mandatory, dotted `<type>.<inner>` ref into
-            // model_providers.<type>.<inner>.
-            let mp = agent.model_provider.trim();
-            if mp.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
-                );
-            }
-            match mp.split_once('.') {
-                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                    if !crate::providers::ModelProviders::slot_names().contains(&ty) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
-                        );
-                    }
-                    let exists = self
-                        .get_map_keys(&format!("providers.models.{ty}"))
-                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
-                        );
-                    }
-                }
-                _ => validation_bail!(
-                    InvalidFormat,
-                    format!("agents.{alias}.model_provider"),
-                    "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
-                ),
-            }
-
-            // channels: each entry is a dotted `<type>.<inner>` ref into
-            // channels.<type>.<inner>. Empty list is valid (delegate-only agent).
-            // Uses the schema-derived `get_map_keys` so new channel types
-            // surface here automatically — no per-type match arm.
-            for (i, ch) in agent.channels.iter().enumerate() {
-                let trimmed = ch.trim();
-                match trimmed.split_once('.') {
-                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                        // `get_map_keys` stores section names using the raw
-                        // field ident (snake), the same dotted form the
-                        // operator sees in TOML (`gmail_push`, `voice_call`,
-                        // `nextcloud_talk`). Look up verbatim.
-                        let exists = self
-                            .get_map_keys(&format!("channels.{ty}"))
-                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                        if !exists {
-                            validation_bail!(
-                                DanglingReference,
-                                format!("agents.{alias}.channels[{i}]"),
-                                "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
-                            );
-                        }
-                    }
-                    _ => validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.channels[{i}]"),
-                        "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
-                    ),
-                }
-            }
-
-            // Per-agent provider refs that resolve into the typed provider
-            // sections. Empty = no preference for that category (no TTS / no
-            // STT for this agent), which is valid. Non-empty values must
-            // match a configured `[providers.<category>.<type>.<alias>]`
-            // entry, fail loud with the dangling ref otherwise.
-            // there is no global default-X-provider concept — every consumer
-            // either picks a configured alias or opts out entirely.
-            let typed_provider_refs: &[(&str, &str, &str)] = &[
-                ("providers.tts", "tts_provider", agent.tts_provider.trim()),
-                (
-                    "providers.transcription",
-                    "transcription_provider",
-                    agent.transcription_provider.trim(),
-                ),
-                // New field:
-                (
-                    "providers.models",
-                    "classifier_provider",
-                    agent.classifier_provider.trim(),
-                ),
-                // Agent-level context-compression summarizer override.
-                (
-                    "providers.models",
-                    "summary_provider",
-                    agent.summary_provider.trim(),
-                ),
-            ];
-            for (section_prefix, field, value) in typed_provider_refs {
-                if value.is_empty() {
-                    continue;
-                }
-                match value.split_once('.') {
-                    Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
-                        let exists = self
-                            .get_map_keys(&format!("{section_prefix}.{ty}"))
-                            .is_some_and(|keys| keys.iter().any(|k| k == inner));
-                        if !exists {
-                            validation_bail!(
-                                DanglingReference,
-                                format!("agents.{alias}.{field}"),
-                                "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
-                            );
-                        }
-                    }
-                    _ => validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.{field}"),
-                        "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
-                    ),
-                }
-            }
-
-            // Bare-alias bundle refs. Tuple is (kebab section path, kebab
-            // agent field name, value list). Both names use the schema's
-            // kebab form: section name matches what `get_map_keys` expects
-            // (macro converts snake→kebab via `snake_to_kebab` per
-            // crates/zeroclaw-macros/src/lib.rs:1056); field name matches
-            // what `prop_fields()` emits, so DanglingReference paths bind
-            // directly to the right inline error in the dashboard form.
-            let bare_multi: &[(&str, &str, &[String])] = &[
-                ("skill_bundles", "skill_bundles", &agent.skill_bundles),
-                (
-                    "knowledge_bundles",
-                    "knowledge_bundles",
-                    &agent.knowledge_bundles,
-                ),
-                ("mcp_bundles", "mcp_bundles", &agent.mcp_bundles),
-            ];
-            for (section, field, values) in bare_multi {
-                for (i, key) in values.iter().enumerate() {
-                    let trimmed = key.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let exists = self
-                        .get_map_keys(section)
-                        .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
-                    if !exists {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("agents.{alias}.{field}[{i}]"),
-                            "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
-                        );
-                    }
-                }
-            }
-            let bare_single: &[(&str, &str, &str)] = &[
-                ("risk_profiles", "risk_profile", agent.risk_profile.as_str()),
-                (
-                    "runtime_profiles",
-                    "runtime_profile",
-                    agent.runtime_profile.as_str(),
-                ),
-            ];
-            for (section, field, raw) in bare_single {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let exists = self
-                    .get_map_keys(section)
-                    .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
-                if !exists {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.{field}"),
-                        "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
-                    );
-                }
-            }
-
-            // risk_profile is mandatory for enabled agents — there is no
-            // global fallback, so an enabled agent with no profile can't
-            // gate its actions. Run this check last so the more specific
-            // dangling/format errors above surface first.
-            if agent.enabled && agent.risk_profile.trim().is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("agents.{alias}.risk_profile"),
-                    "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
-                );
-            }
-
-            // delegates: explicit roster entries must point at OTHER
-            // configured agents, never self. Cross-profile targets are
-            // permitted (they run under the target's own policy), so no
-            // profile match is required here.
-            let mut seen_delegates: std::collections::BTreeSet<&str> =
-                std::collections::BTreeSet::new();
-            for (i, target) in agent.delegates.iter().enumerate() {
-                let target_str = target.agent().trim();
-                if target_str.is_empty() {
-                    validation_bail!(
-                        RequiredFieldEmpty,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent is empty; remove it or name a configured agent",
-                    );
-                }
-                if target_str == alias.as_str() {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent = {target_str:?} names this agent itself; an agent cannot delegate to itself",
-                    );
-                }
-                if !self.agents.contains_key(target_str) {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
-                    );
-                }
-                if !seen_delegates.insert(target_str) {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.delegates[{i}].agent"),
-                        "agents.{alias}.delegates[{i}].agent = {target_str:?} duplicates an earlier delegate target",
-                    );
-                }
-            }
-
-            // workspace.access: keys must point at OTHER agents, never
-            // self, and every target must be a configured agent.
-            for (target, mode) in &agent.workspace.access {
-                let target_str = target.as_str();
-                if target_str == alias.as_str() {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.access.{target_str}"),
-                        "agents.{alias}.workspace.access.{target_str} = {mode:?} but {target_str} is this agent itself; an agent always has full access to its own workspace, so self-references in the cross-agent allowlist are not permitted",
-                    );
-                }
-                if !self.agents.contains_key(target_str) {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.workspace.access.{target_str}"),
-                        "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
-                    );
-                }
-            }
-
-            // workspace.read_memory_from: every grant must name a configured
-            // agent, use the same MemoryBackendKind as the declaring agent,
-            // and appear at most once. Legacy string grants are unrestricted;
-            // structured grants may carry an exact category allowlist. An
-            // explicitly empty category list is invalid rather than silently
-            // becoming unrestricted. Mismatched backends fail at config load
-            // rather than producing a runtime error when the per-agent memory
-            // plumbing consumes the allowlist.
-            let agent_backend = agent.memory.backend;
-            let mut seen_memory_grants: std::collections::BTreeSet<&str> =
-                std::collections::BTreeSet::new();
-            for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
-                let target_str = target.as_str();
-                if target
-                    .categories()
-                    .is_some_and(|categories| categories.is_empty())
-                {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
-                        "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
-                    );
-                }
-                if !seen_memory_grants.insert(target_str) {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
-                        "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
-                    );
-                }
-                if target_str == alias.as_str() {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own memory rows, so self-references in the cross-agent allowlist are not permitted",
-                    );
-                }
-                let Some(target_agent) = self.agents.get(target_str) else {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
-                    );
-                };
-                if target.categories().is_some()
-                    && matches!(
-                        agent_backend,
-                        crate::multi_agent::MemoryBackendKind::Markdown
-                    )
-                {
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
-                    );
-                }
-                if target_agent.memory.backend != agent_backend {
-                    let target_backend = target_agent.memory.backend;
-                    validation_bail!(
-                        InvalidFormat,
-                        format!("agents.{alias}.workspace.read_memory_from[{i}]"),
-                        "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
-                    );
-                }
-            }
+            self.validate_agent(alias)?;
         }
 
         // Peer groups: every member alias must exist as a configured
@@ -26064,6 +26074,447 @@ impl Config {
         self.set_prop(name, value_str)?;
         self.mark_dirty(name);
         Ok(())
+    }
+
+    /// True when `error` is an empty agent required field that staged repair is
+    /// expected to leave behind, rather than a complaint about the value just
+    /// written to `edited_path`.
+    ///
+    /// Two shapes qualify. The complementary field of the agent being edited:
+    /// an agent completed field-by-field is invalid between writes. And any
+    /// required field of a *different* agent: `validate()` walks agents in
+    /// sorted alias order and stops at its first error, so an unrelated staged
+    /// agent must not block this one from being repaired.
+    ///
+    /// The edited field itself never qualifies -- if the value just written is
+    /// the empty one, that is this write's own error.
+    fn is_complementary_required_agent_field(
+        &self,
+        edited_path: &str,
+        error: &crate::api_error::ConfigApiError,
+    ) -> bool {
+        use crate::api_error::ConfigApiCode;
+
+        if error.code != ConfigApiCode::RequiredFieldEmpty {
+            return false;
+        }
+        let Some(error_path) = error.path.as_deref() else {
+            return false;
+        };
+
+        // Staged model/embedding routes mirror staged agents: a route completed
+        // field-by-field is invalid between writes. `validate()` reports route
+        // fields by array index, while the RPC edit path is hint-keyed, so the
+        // edited hint is resolved to its index before the comparison.
+        if let Some((kind, hint, edited_field)) = Self::route_required_field(edited_path) {
+            let Some(edited_index) = self.route_index(kind, hint) else {
+                return false;
+            };
+            let Some((error_kind, error_index, error_field)) = Self::route_error_field(error_path)
+            else {
+                return false;
+            };
+            if kind != error_kind {
+                return false;
+            }
+            if edited_index != error_index {
+                return true;
+            }
+            return edited_field != error_field;
+        }
+
+        let Some((error_agent, error_field)) = Self::agent_required_field(error_path) else {
+            return false;
+        };
+        // The edited path may be one of the agent's required references itself, or
+        // any other field on the agent being authored (`enabled`, `channels`, ...).
+        // Building an agent field-by-field is legitimate, but only while the agent
+        // is still a blank scaffold: the caller re-validates with the companion
+        // fields filled, so a value that references something dangling is rejected.
+        let mut parts = edited_path.split('.');
+        let (edited_agent, edited_field) =
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some("agents"), Some(agent), Some(field), None) => (agent, field),
+                _ => return false,
+            };
+
+        if edited_agent != error_agent {
+            return true;
+        }
+        // Editing the very required field the error names is not a companion case.
+        if edited_path == format!("agents.{error_agent}.{error_field}") {
+            return false;
+        }
+        // Editing one required reference while its companion is still empty is the
+        // staged reference-authoring case.
+        if edited_field == "model_provider" || edited_field == "risk_profile" {
+            return true;
+        }
+        // Editing any other field (`enabled`, `channels`, ...) only counts as
+        // scaffolding while the agent has no required reference configured at all.
+        // Once one reference is set, enabling the agent with the other still empty
+        // must surface the incompleteness rather than wave it through.
+        match self.agents.get(edited_agent) {
+            Some(agent) => {
+                agent.model_provider.trim().is_empty() && agent.risk_profile.trim().is_empty()
+            }
+            None => false,
+        }
+    }
+
+    /// Parse a route required-field edit path `model_routes.<hint>.<field>` or
+    /// `embedding_routes.<hint>.<field>` into `(kind, hint, field)`.
+    fn route_required_field(path: &str) -> Option<(&str, &str, &str)> {
+        let mut parts = path.split('.');
+        let (Some(kind), Some(hint), Some(field), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        if kind != "model_routes" && kind != "embedding_routes" {
+            return None;
+        }
+        if hint.is_empty() {
+            return None;
+        }
+        matches!(field, "model_provider" | "model").then_some((kind, hint, field))
+    }
+
+    /// Parse a route required-field *error* path emitted by `validate()`, which
+    /// is index-keyed: `model_routes[<i>].<field>` / `embedding_routes[<i>].<field>`.
+    fn route_error_field(path: &str) -> Option<(&str, usize, &str)> {
+        let (kind, rest) = path.split_once('[')?;
+        if kind != "model_routes" && kind != "embedding_routes" {
+            return None;
+        }
+        let (index_text, rest) = rest.split_once(']')?;
+        let index = index_text.parse::<usize>().ok()?;
+        let field = rest.strip_prefix('.')?;
+        if field.is_empty() {
+            return None;
+        }
+        matches!(field, "model_provider" | "model").then_some((kind, index, field))
+    }
+
+    /// Resolve a route hint to its index in the matching route vec.
+    fn route_index(&self, kind: &str, hint: &str) -> Option<usize> {
+        match kind {
+            "model_routes" => self
+                .model_routes
+                .iter()
+                .position(|route| route.hint.trim() == hint),
+            "embedding_routes" => self
+                .embedding_routes
+                .iter()
+                .position(|route| route.hint.trim() == hint),
+            _ => None,
+        }
+    }
+
+    fn validate_edited_route_required_field(&self, path: &str) -> Result<()> {
+        let Some((kind, hint, field)) = Self::route_required_field(path) else {
+            return Ok(());
+        };
+        let values = self.route_index(kind, hint).and_then(|index| match kind {
+            "model_routes" => self
+                .model_routes
+                .get(index)
+                .map(|route| (&route.model_provider, &route.model)),
+            "embedding_routes" => self
+                .embedding_routes
+                .get(index)
+                .map(|route| (&route.model_provider, &route.model)),
+            _ => None,
+        });
+        let Some((provider, model)) = values else {
+            validation_bail!(DanglingReference, path, "{kind}.{hint} is not configured");
+        };
+        let value = if field == "model" { model } else { provider }.trim();
+        if value.is_empty() {
+            validation_bail!(RequiredFieldEmpty, path, "{path} must not be empty");
+        }
+        if field == "model_provider" {
+            // Whole-config validation can stop at an incomplete sibling before
+            // reaching this route. Judge the edited reference independently.
+            match value.split_once('.') {
+                Some((family, alias)) if !family.is_empty() && !alias.is_empty() => {
+                    if self.providers.models.find(family, alias).is_none() {
+                        validation_bail!(
+                            DanglingReference,
+                            path,
+                            "{path} = {value:?} does not reference a configured model provider"
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path} must be dotted form `<type>.<alias>` (got {value:?})"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_edited_agent_required_reference(&self, path: &str) -> Result<()> {
+        let Some((alias, field)) = Self::agent_required_field(path) else {
+            return Ok(());
+        };
+        let Some(agent) = self.agents.get(alias) else {
+            validation_bail!(
+                DanglingReference,
+                format!("agents.{alias}"),
+                "agents.{alias} is not configured"
+            );
+        };
+        match field {
+            "model_provider" => {
+                let value = agent.model_provider.trim();
+                if value.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        path,
+                        "{path} must reference a configured model provider"
+                    );
+                }
+                let Some((family, provider_alias)) = value.split_once(".") else {
+                    validation_bail!(
+                        InvalidFormat,
+                        path,
+                        "{path} must be dotted form `<type>.<alias>` (got {value:?})"
+                    );
+                };
+                let exists = crate::providers::ModelProviders::slot_names().contains(&family)
+                    && self
+                        .get_map_keys(&format!("providers.models.{family}"))
+                        .is_some_and(|keys| keys.iter().any(|key| key == provider_alias));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        path,
+                        "{path} = {value:?} does not reference a configured model provider"
+                    );
+                }
+            }
+            "risk_profile" => {
+                let value = agent.risk_profile.trim();
+                if value.is_empty() {
+                    if agent.enabled {
+                        validation_bail!(
+                            RequiredFieldEmpty,
+                            path,
+                            "{path} must reference a configured risk profile"
+                        );
+                    }
+                    return Ok(());
+                }
+                let exists = self
+                    .get_map_keys("risk_profiles")
+                    .is_some_and(|keys| keys.iter().any(|key| key == value));
+                if !exists {
+                    validation_bail!(
+                        DanglingReference,
+                        path,
+                        "{path} = {value:?} but risk_profiles.{value} is not configured"
+                    );
+                }
+            }
+            _ => unreachable!("agent_required_field returned an unsupported field"),
+        }
+        Ok(())
+    }
+
+    fn agent_required_field(path: &str) -> Option<(&str, &str)> {
+        let mut parts = path.split('.');
+        let (Some("agents"), Some(agent), Some(field), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        matches!(field, "model_provider" | "risk_profile").then_some((agent, field))
+    }
+
+    /// Whether the error path names the same `agents.<alias>` entry that `edited_path` edits.
+    ///
+    /// Errors on a sibling field of the agent being edited keep the old refusal: the agent's
+    /// required references are coupled. A error on a *different* agent, or anywhere outside
+    /// `agents.*`, is unrelated and must not wedge this write.
+    fn error_in_same_agent_namespace(edited_path: &str, error_path: Option<&str>) -> bool {
+        let Some(error_path) = error_path else {
+            return false;
+        };
+        let edited_agent = edited_path
+            .strip_prefix("agents.")
+            .and_then(|rest| rest.split('.').next());
+        let error_agent = error_path
+            .strip_prefix("agents.")
+            .and_then(|rest| rest.split('.').next());
+        matches!((edited_agent, error_agent), (Some(a), Some(b)) if a == b)
+    }
+
+    /// Apply and validate a persistent property update atomically.
+    ///
+    /// Validation runs on a working copy so a rejected value cannot mutate the
+    /// live config or leave a dirty path behind.
+    ///
+    /// The write is refused only when the resulting error belongs to the path
+    /// being edited (or has no path it can be attributed to), is a pathless
+    /// error, is on the same agent being edited, or fails the staged companion
+    /// probe. A pre-existing validation error on an unrelated section does not
+    /// hold up the write: the candidate is installed and that error is returned
+    /// as a warning, so the boot-time repair surface (`config set`) is not
+    /// wedged by an error elsewhere in the file. Staged agent and route
+    /// completion keeps its companion-field exception.
+    pub fn set_prop_persistent_validated(
+        &mut self,
+        name: &str,
+        value_str: &str,
+    ) -> Result<Option<crate::api_error::ConfigApiError>> {
+        let mut candidate = self.clone();
+        candidate.set_prop_persistent(name, value_str)?;
+        candidate.validate_edited_agent_required_reference(name)?;
+        candidate.validate_edited_route_required_field(name)?;
+        let edited_paths = std::collections::HashSet::from([name.to_string()]);
+        let mut pre_existing_warning = None;
+        if let Err(error) = candidate.validate() {
+            let api_error = crate::api_error::ConfigApiError::from_validation(error);
+            let complementary = self.is_complementary_required_agent_field(name, &api_error);
+            let pathless = api_error.path.as_deref().map(str::is_empty).unwrap_or(true);
+            let touches_edited = api_error.touches_any_path(&edited_paths);
+            if !complementary && (pathless || touches_edited) {
+                // The error belongs to the write itself, or has no path to
+                // attribute it to: fail closed and refuse.
+                return Err(anyhow::Error::new(api_error));
+            }
+            if complementary {
+                // The surfaced error is a still-empty companion field on the
+                // entry being authored, so staged repair may proceed. But
+                // `validate()` stops at its first error, and that error says
+                // nothing about the value just written. Re-validate with the
+                // companion fields filled in so any error belonging to *this*
+                // write -- a dangling reference, say -- is not waved through.
+                if let Some(probe) = candidate.probe_with_complementary_agent_fields_filled(name)
+                    && let Err(error) = probe.validate()
+                {
+                    let probe_error = crate::api_error::ConfigApiError::from_validation(error);
+                    if !self.is_complementary_required_agent_field(name, &probe_error) {
+                        return Err(anyhow::Error::new(probe_error));
+                    }
+                }
+            } else if Self::error_in_same_agent_namespace(name, api_error.path.as_deref()) {
+                // An error on another field of the same agent being edited still
+                // refuses: the agent's required references are coupled, and an
+                // edit such as enabling the agent must not wave through its own
+                // empty reference. Only errors on unrelated sections are warned.
+                return Err(anyhow::Error::new(api_error));
+            } else {
+                // A pre-existing error on an unrelated section: the edited value
+                // is valid, so install it and surface the old error as a warning
+                // rather than holding the write hostage to state that was already
+                // broken before this edit.
+                pre_existing_warning = Some(api_error);
+            }
+        }
+        *self = candidate;
+        Ok(pre_existing_warning)
+    }
+
+    /// Clones `self` with every empty agent required field filled with a
+    /// placeholder that satisfies its existence check, except the field named by
+    /// `edited_path`.
+    ///
+    /// Staged repair means agents are legitimately incomplete, so `validate()`
+    /// keeps reporting an empty required field and never reaches the checks that
+    /// would judge the value just written. `validate()` also walks agents in
+    /// sorted alias order and stops at its first error, so an unrelated
+    /// incomplete agent can be the one it reports about. Filling every staged
+    /// field except the edited one lets the next `validate()` pass move past all
+    /// of that, leaving only errors that genuinely belong to this write.
+    ///
+    /// The edited field keeps the caller's value so it is the thing under test.
+    /// Returns `None` when `edited_path` is not an agent required field or no
+    /// placeholder is available, in which case the caller keeps its original
+    /// decision.
+    fn probe_with_complementary_agent_fields_filled(&self, edited_path: &str) -> Option<Self> {
+        // Staged routes: fill the empty companion field on the edited route so
+        // the next `validate()` moves past it and judges the value just written.
+        if let Some((kind, hint, edited_field)) = Self::route_required_field(edited_path) {
+            return self.probe_route_companion(kind, hint, edited_field);
+        }
+        let (edited_agent, edited_field) = Self::agent_required_field(edited_path)?;
+        self.agents.get(edited_agent)?;
+
+        let mut probe = self.clone();
+        let placeholder_provider = self.any_configured_model_provider();
+        let placeholder_risk_profile = self
+            .get_map_keys("risk_profiles")
+            .and_then(|keys| keys.first().cloned());
+
+        for (alias, agent) in probe.agents.iter_mut() {
+            let editing_this_agent = alias == edited_agent;
+
+            if agent.model_provider.trim().is_empty()
+                && !(editing_this_agent && edited_field == "model_provider")
+            {
+                let (family, provider_alias) = placeholder_provider.clone()?;
+                agent.model_provider = format!("{family}.{provider_alias}").into();
+            }
+            if agent.risk_profile.trim().is_empty()
+                && !(editing_this_agent && edited_field == "risk_profile")
+            {
+                agent.risk_profile = placeholder_risk_profile.clone()?.into();
+            }
+        }
+
+        Some(probe)
+    }
+
+    /// Clones `self` with the edited route's empty companion required field
+    /// filled with a placeholder, so a re-validation can reach the check of the
+    /// value just written. The edited field keeps the caller's value.
+    fn probe_route_companion(&self, kind: &str, hint: &str, edited_field: &str) -> Option<Self> {
+        let index = self.route_index(kind, hint)?;
+        let mut probe = self.clone();
+        let fill_provider = |route: &mut String| {
+            let (family, provider_alias) = self.any_configured_model_provider()?;
+            *route = format!("{family}.{provider_alias}");
+            Some(())
+        };
+        match kind {
+            "model_routes" => {
+                let route = probe.model_routes.get_mut(index)?;
+                if route.model_provider.trim().is_empty() && edited_field != "model_provider" {
+                    fill_provider(&mut route.model_provider)?;
+                }
+                if route.model.trim().is_empty() && edited_field != "model" {
+                    route.model = "staged-probe-model".into();
+                }
+            }
+            "embedding_routes" => {
+                let route = probe.embedding_routes.get_mut(index)?;
+                if route.model_provider.trim().is_empty() && edited_field != "model_provider" {
+                    fill_provider(&mut route.model_provider)?;
+                }
+                if route.model.trim().is_empty() && edited_field != "model" {
+                    route.model = "staged-probe-model".into();
+                }
+            }
+            _ => return None,
+        }
+        Some(probe)
+    }
+
+    /// Returns any configured `providers.models.<family>.<alias>` pair.
+    fn any_configured_model_provider(&self) -> Option<(String, String)> {
+        crate::providers::ModelProviders::slot_names()
+            .iter()
+            .find_map(|family| {
+                let alias = self
+                    .get_map_keys(&format!("providers.models.{family}"))?
+                    .first()?
+                    .clone();
+                Some(((*family).to_string(), alias))
+            })
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
@@ -31114,6 +31565,495 @@ enabled = true
                 .contains("gateway.websocket_ping_interval_secs"),
             "error must name the offending path; got: {err}"
         );
+    }
+
+    #[test]
+    async fn persistent_set_validation_is_atomic() {
+        let mut config = Config::default();
+        let gateway_before = toml::to_string(&config.gateway).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+        let path = "gateway.websocket_ping_interval_secs";
+
+        let err = config
+            .set_prop_persistent_validated(
+                path,
+                &(GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1).to_string(),
+            )
+            .expect_err("out-of-range persistent update must be rejected");
+
+        assert!(err.to_string().contains(path));
+        assert_eq!(toml::to_string(&config.gateway).unwrap(), gateway_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    fn staged_agent_repair_config() -> Config {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+            "#,
+        )
+        .unwrap();
+        config
+            .agents
+            .insert("worker".to_string(), AliasedAgentConfig::default());
+        config
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_staged_model_route_completion() {
+        // A model route created field-by-field is invalid between writes: the
+        // companion required field stays empty until the next write. The staged
+        // exception must tolerate that companion error, exactly as it does for
+        // staged agents, while still leaving the route incomplete until both
+        // fields are populated.
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+            "#,
+        )
+        .unwrap();
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            ..ModelRouteConfig::default()
+        });
+
+        config
+            .set_prop_persistent_validated(
+                "model_routes.reasoning.model_provider",
+                "openai.primary",
+            )
+            .expect("the staged route provider write must succeed");
+        assert_eq!(config.model_routes[0].model_provider, "openai.primary");
+        assert!(
+            config.validate().is_err(),
+            "a route with only its provider set must stay incomplete"
+        );
+
+        config
+            .set_prop_persistent_validated("model_routes.reasoning.model", "gpt-test")
+            .expect("completing the staged route must succeed");
+        assert!(config.validate().is_ok(), "the route is now complete");
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_dangling_staged_route_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+            "#,
+        )
+        .unwrap();
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            ..ModelRouteConfig::default()
+        });
+
+        let err = config
+            .set_prop_persistent_validated("model_routes.reasoning.model_provider", "nope.missing")
+            .expect_err("a dangling route provider must be rejected even while staged");
+        assert!(err.to_string().contains("nope.missing"));
+        assert_eq!(config.model_routes[0].model_provider, "");
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_bad_route_with_incomplete_sibling() {
+        for kind in ["model_routes", "embedding_routes"] {
+            for (field, value) in [
+                ("model_provider", "nope.missing"),
+                ("model_provider", "openai.missing"),
+                ("model_provider", "not-dotted"),
+                ("model_provider", ""),
+                ("model", "   "),
+            ] {
+                let mut config: Config = toml::from_str(&format!(
+                    r#"
+                        [providers.models.openai.primary]
+                        api_key = "test-key"
+                        model = "gpt-test"
+
+                        [[{kind}]]
+                        hint = "alpha"
+
+                        [[{kind}]]
+                        hint = "beta"
+                        model_provider = "openai.primary"
+                        model = "gpt-test"
+                    "#
+                ))
+                .unwrap();
+                config.mark_dirty("gateway.port");
+                let before = toml::to_string(&config).unwrap();
+                let dirty_before = config.dirty_paths.clone();
+                let path = format!("{kind}.beta.{field}");
+
+                let error = config
+                    .set_prop_persistent_validated(&path, value)
+                    .expect_err("an incomplete sibling must not hide an invalid edited field");
+
+                assert!(error.to_string().contains(&path), "{kind}: {error}");
+                assert_eq!(toml::to_string(&config).unwrap(), before, "{path}");
+                assert_eq!(config.dirty_paths, dirty_before, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_repairs_route_with_incomplete_sibling() {
+        for kind in ["model_routes", "embedding_routes"] {
+            for fields in [
+                [("model_provider", "openai.primary"), ("model", "gpt-test")],
+                [("model", "gpt-test"), ("model_provider", "openai.primary")],
+            ] {
+                let mut config: Config = toml::from_str(&format!(
+                    r#"
+                        [providers.models.openai.primary]
+                        api_key = "test-key"
+                        model = "gpt-test"
+
+                        [[{kind}]]
+                        hint = "alpha"
+
+                        [[{kind}]]
+                        hint = "beta"
+                    "#
+                ))
+                .unwrap();
+                for (field, value) in fields {
+                    let path = format!("{kind}.beta.{field}");
+                    config
+                        .set_prop_persistent_validated(&path, value)
+                        .expect("a valid staged write must tolerate an incomplete sibling");
+                    assert!(config.dirty_paths.contains(&path));
+                }
+                let routes = toml::Value::try_from(&config).unwrap();
+                let routes = routes[kind].as_array().unwrap();
+                assert_eq!(routes[0]["model_provider"].as_str(), Some(""));
+                assert_eq!(routes[0]["model"].as_str(), Some(""));
+                assert_eq!(routes[1]["model_provider"].as_str(), Some("openai.primary"));
+                assert_eq!(routes[1]["model"].as_str(), Some("gpt-test"));
+            }
+        }
+    }
+
+    #[test]
+    async fn validate_agent_ignores_other_incomplete_agents() {
+        let mut config = staged_agent_repair_config();
+        config
+            .agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+        config.agents.get_mut("worker").unwrap().model_provider = "openai.primary".into();
+        config.agents.get_mut("worker").unwrap().risk_profile = "standard".into();
+
+        config
+            .validate_agent("worker")
+            .expect("the selected complete agent should validate independently");
+        assert!(config.validate_agent("alpha").is_err());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_provider_first_agent_repair() {
+        let mut config = staged_agent_repair_config();
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        assert_eq!(config.agents["worker"].model_provider, "openai.primary");
+        assert!(config.validate().is_err());
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_risk_profile_first_agent_repair() {
+        let mut config = staged_agent_repair_config();
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .unwrap();
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
+        assert!(config.validate().is_err());
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_dangling_risk_profile_during_agent_repair() {
+        // A freshly staged agent has BOTH required fields empty, so the first
+        // error `validate()` reports is RequiredFieldEmpty on `model_provider`
+        // -- the complementary-field error the staged-repair exception is meant
+        // to tolerate. Writing a `risk_profile` that has no
+        // [risk_profiles.<alias>] entry must still be rejected: the exception
+        // only sees that first error, so a DanglingReference on the field being
+        // written can otherwise ride along and be persisted.
+        let mut config = staged_agent_repair_config();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "does-not-exist")
+            .expect_err("a risk_profile with no [risk_profiles.<alias>] entry must be rejected");
+
+        assert!(
+            err.to_string().contains("does-not-exist"),
+            "error should name the missing risk profile, got: {err}"
+        );
+        assert_eq!(
+            config.agents["worker"].risk_profile, "",
+            "a rejected write must not persist a dangling reference"
+        );
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_dangling_risk_profile_without_any_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [risk_profiles.standard]
+                level = "supervised"
+            "#,
+        )
+        .unwrap();
+        config
+            .agents
+            .insert("worker".to_string(), AliasedAgentConfig::default());
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "does-not-exist")
+            .expect_err("the edited risk profile must be checked without a provider placeholder");
+
+        assert!(err.to_string().contains("does-not-exist"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_valid_risk_profile_without_any_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [risk_profiles.standard]
+                level = "supervised"
+            "#,
+        )
+        .unwrap();
+        config
+            .agents
+            .insert("worker".to_string(), AliasedAgentConfig::default());
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .expect("a valid edited reference should remain a supported staged write");
+
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_repairs_agent_despite_other_incomplete_agent() {
+        // Two staged agents, both incomplete. `validate()` walks agents in
+        // sorted alias order and stops at the first error, so "alpha" is the
+        // one it reports about. Repairing "worker" must still be possible: the
+        // staged-repair exception has to recognise that the surfaced error
+        // belongs to a different agent than the one being edited, otherwise an
+        // alphabetically earlier incomplete agent permanently blocks every
+        // later agent from being completed field-by-field.
+        let mut config = staged_agent_repair_config();
+        config
+            .agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .expect("an unrelated incomplete agent must not block repairing this one");
+        assert_eq!(config.agents["worker"].model_provider, "openai.primary");
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .expect("an unrelated incomplete agent must not block repairing this one");
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_repairing_empty_agent_model_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+
+                [agents.worker]
+                enabled = true
+                model_provider = ""
+                risk_profile = "standard"
+            "#,
+        )
+        .unwrap();
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_invalid_agent_array_element() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+
+                [agents.worker]
+                enabled = true
+                model_provider = "openai.primary"
+                risk_profile = "standard"
+            "#,
+        )
+        .unwrap();
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.channels", r#"["telegram.missing"]"#)
+            .expect_err("an invalid array element at the edited path must be rejected");
+
+        assert!(err.to_string().contains("agents.worker.channels[0]"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_non_required_cross_field_error() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [agents.worker]
+                enabled = false
+                model_provider = "openai.primary"
+                risk_profile = ""
+            "#,
+        )
+        .unwrap();
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.enabled", "true")
+            .expect_err("only the two required agent references may be staged");
+
+        assert!(err.to_string().contains("agents.worker.risk_profile"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_repairs_unrelated_preexisting_errors_one_at_a_time() {
+        // Two pre-existing validation errors on unrelated sections must not
+        // deadlock `config set`: each repair installs and surfaces the other
+        // remaining error as a warning until the file is fully consistent.
+        let mut config: Config = toml::from_str(
+            r#"
+                [gateway]
+                websocket_ping_interval_secs = 999999
+
+                [scheduler]
+                max_concurrent = 0
+            "#,
+        )
+        .unwrap();
+
+        // First write repairs the scheduler error; the gateway error remains and
+        // comes back as a warning.
+        let warning = config
+            .set_prop_persistent_validated("scheduler.max_concurrent", "4")
+            .expect("a valid repair must not be refused by an unrelated error")
+            .expect("the unrelated gateway error is surfaced as a warning");
+        assert_eq!(
+            warning.path.as_deref(),
+            Some("gateway.websocket_ping_interval_secs")
+        );
+        assert_eq!(config.scheduler.max_concurrent, 4);
+
+        // Now repair the gateway error; nothing should remain.
+        let resolved = config
+            .set_prop_persistent_validated("gateway.websocket_ping_interval_secs", "30")
+            .expect("repairing the last unrelated error must succeed");
+        assert!(
+            resolved.is_none(),
+            "config should be fully valid after both repairs"
+        );
+        config.validate().expect("config valid after both repairs");
+    }
+
+    #[test]
+    async fn set_prop_allows_unrelated_write_with_existing_error() {
+        // A write to one section must succeed while an unrelated section is
+        // still invalid; the unrelated error is reported, not held against the
+        // valid write.
+        let mut config: Config = toml::from_str(
+            r#"
+                [gateway]
+                port = 8080
+                websocket_ping_interval_secs = 999999
+            "#,
+        )
+        .unwrap();
+
+        let warning = config
+            .set_prop_persistent_validated("gateway.port", "12345")
+            .expect("a valid unrelated write must not be refused")
+            .expect("the pre-existing ping-interval error is surfaced as a warning");
+        assert_eq!(
+            warning.path.as_deref(),
+            Some("gateway.websocket_ping_interval_secs")
+        );
+        assert_eq!(config.gateway.port, 12345);
+    }
+
+    #[test]
+    async fn set_prop_rejects_bad_edited_value_despite_unrelated_error() {
+        // A bad value on the field being edited is still refused even when
+        // another, unrelated section is already invalid.
+        let mut config: Config = toml::from_str(
+            r#"
+                [scheduler]
+                max_concurrent = 0
+            "#,
+        )
+        .unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("gateway.websocket_ping_interval_secs", "999999")
+            .expect_err("a value out of range on the edited field must be refused");
+        assert!(
+            err.to_string()
+                .contains("gateway.websocket_ping_interval_secs")
+        );
+        assert_eq!(config.dirty_paths, dirty_before);
     }
 
     #[test]
