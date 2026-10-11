@@ -10699,21 +10699,49 @@ async fn process_channel_message_body(
                                 true
                             }
                             Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
+                                // Telegram flood-control exhaustion is not a
+                                // formatting failure: the token is inside an
+                                // active 429 window that already outlasted the
+                                // wait budget, so the fresh-send fallback would
+                                // only hit the same gate. Stop instead.
+                                #[cfg(feature = "channel-telegram")]
+                                let flood_limited = e
+                                    .downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(
                                     )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Failed to finalize draft; sending as new message"
-                                );
-                                let mut fallback = SendMessage::reply_to(&msg, &delivered_response);
-                                if suppress {
-                                    fallback = fallback.suppress_voice();
+                                    .is_some();
+                                #[cfg(not(feature = "channel-telegram"))]
+                                let flood_limited = false;
+                                if flood_limited {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        "Final answer held: Telegram flood-control window outlasted \
+                                         the wait budget; not falling back to a fresh send"
+                                    );
+                                    false
+                                } else {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        "Failed to finalize draft; sending as new message"
+                                    );
+                                    let mut fallback =
+                                        SendMessage::reply_to(&msg, &delivered_response);
+                                    if suppress {
+                                        fallback = fallback.suppress_voice();
+                                    }
+                                    channel.send_final(&fallback).await.is_ok()
                                 }
-                                channel.send_final(&fallback).await.is_ok()
                             }
                         }
                     }
@@ -51008,6 +51036,8 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                rate_limit_max_wait_secs: 60,
+                typing_refresh_interval_secs: 4,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
@@ -51040,6 +51070,8 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                rate_limit_max_wait_secs: 60,
+                typing_refresh_interval_secs: 4,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
