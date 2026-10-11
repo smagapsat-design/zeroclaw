@@ -151,6 +151,14 @@ action, attachment ID, and, when setting content, the exact content and its
 SHA-256 digest. If the active approval surface cannot show that binding, the
 mutation is denied.
 
+The preview visibly escapes control characters, Unicode format characters and
+default-ignorable characters (including zero-width joiners, variation selectors
+and Unicode tags) as `\u{...}`. Quotes, backslashes, newlines and tabs are also
+escaped. This makes otherwise hidden proposed text inspectable; it can change
+the displayed appearance of legitimate joined text or emoji. These encodings
+apply to the session identifier and proposed content only in the confirmation:
+stored content, its digest and later model context retain the original bytes.
+
 Strict confirmations use literal previews on CLI, Matrix, Slack, Telegram,
 Signal, Web and ZeroCode. They do not interpret proposed content as attachment
 markers or rich-text instructions. Slack and Telegram deny a confirmation that

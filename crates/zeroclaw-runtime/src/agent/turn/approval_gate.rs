@@ -414,7 +414,9 @@ fn session_prompt_approval_summary(
 }
 
 /// Render untrusted prompt text for an approval surface without allowing
-/// terminal controls or invisible direction changes to affect the display.
+/// terminal controls or invisible format characters to conceal its content.
+/// This is a display encoding only; storage, hashing and injection use the
+/// original text, including joiners and variation selectors.
 fn escape_prompt_preview(content: &str) -> String {
     let mut escaped = String::with_capacity(content.len() + 2);
     escaped.push('"');
@@ -425,17 +427,7 @@ fn escape_prompt_preview(content: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
-            ch if ch.is_control()
-                || matches!(
-                    ch,
-                    '\u{200e}'
-                    | '\u{200f}'
-                        | '\u{061c}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2066}'..='\u{2069}'
-                        | '\u{feff}'
-                ) =>
-            {
+            ch if ch.is_control() || is_invisible_prompt_character(ch) => {
                 let _ = write!(escaped, "\\u{{{:04X}}}", ch as u32);
             }
             ch => escaped.push(ch),
@@ -443,6 +435,42 @@ fn escape_prompt_preview(content: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+/// Union of Unicode 17 Default_Ignorable_Code_Point and General_Category=Cf.
+/// Keep reserved default-ignorables too: a renderer cannot make them reliably
+/// inspectable. The exhaustive property regression detects table drift.
+/// Sources: https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt
+/// and https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt.
+fn is_invisible_prompt_character(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{115f}'..='\u{1160}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e0fff}'
+    )
 }
 
 async fn gate_session_prompt_approval(
@@ -580,8 +608,8 @@ fn is_one_time_session_prompt_approval(
 mod tests {
     use super::{
         ApprovalGateOutcome, escape_prompt_preview, gate_tool_approval, generic_approval_arguments,
-        is_one_time_session_prompt_approval, is_session_prompt_mutation,
-        session_prompt_approval_summary,
+        is_invisible_prompt_character, is_one_time_session_prompt_approval,
+        is_session_prompt_mutation, session_prompt_approval_summary,
     };
     use crate::agent::turn::context::TurnCtx;
     use crate::approval::ApprovalManager;
@@ -1359,6 +1387,94 @@ mod tests {
         assert!(!preview.contains('\u{009b}'));
         assert!(!preview.contains('\u{061c}'));
         assert!(!preview.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn session_prompt_preview_exposes_invisible_unicode_without_mutating_content() {
+        // Representatives of every Unicode 17 Cf/default-ignorable range,
+        // including reserved default-ignorables, not only the reported tags.
+        let invisible = [
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{0600}',
+            '\u{061c}',
+            '\u{06dd}',
+            '\u{070f}',
+            '\u{0890}',
+            '\u{08e2}',
+            '\u{115f}',
+            '\u{17b4}',
+            '\u{180b}',
+            '\u{180e}',
+            '\u{180f}',
+            '\u{200b}',
+            '\u{202a}',
+            '\u{2060}',
+            '\u{2065}',
+            '\u{2066}',
+            '\u{3164}',
+            '\u{fe00}',
+            '\u{feff}',
+            '\u{ffa0}',
+            '\u{fff0}',
+            '\u{fff9}',
+            '\u{110bd}',
+            '\u{110cd}',
+            '\u{13430}',
+            '\u{1bca0}',
+            '\u{1d173}',
+            '\u{e0000}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e0041}',
+            '\u{e0080}',
+            '\u{e0100}',
+            '\u{e01f0}',
+            '\u{e0fff}',
+        ];
+        for ch in invisible {
+            let content = format!("Keep task.{ch}");
+            let (_, stored) =
+                zeroclaw_infra::session_prompts::validate_prompt("task", &content).unwrap();
+            assert_eq!(
+                escape_prompt_preview(&content),
+                format!("\"Keep task.\\u{{{:04X}}}\"", ch as u32),
+                "invisible character U+{:04X} must be inspectable",
+                ch as u32,
+            );
+            assert_eq!(stored, content);
+            let rendered = zeroclaw_infra::session_prompts::render_session_prompts(&[
+                zeroclaw_infra::session_prompts::SessionPrompt {
+                    id: "task".into(),
+                    content: stored,
+                    updated_at: String::new(),
+                },
+            ]);
+            assert!(
+                rendered.contains(ch),
+                "model context must retain original content"
+            );
+        }
+        assert_eq!(
+            escape_prompt_preview("Завдання: café 日本語 🙂"),
+            "\"Завдання: café 日本語 🙂\""
+        );
+    }
+
+    #[test]
+    fn session_prompt_preview_unicode_table_matches_complete_properties() {
+        // Independent property tables from our existing regex dependency,
+        // not a duplicate of the production ranges or a few chosen samples.
+        let invisible = regex::Regex::new(r"[\p{Cf}\p{Default_Ignorable_Code_Point}]").unwrap();
+        let mut bytes = [0; 4];
+        for ch in (0..=0x10ffff).filter_map(char::from_u32) {
+            assert_eq!(
+                is_invisible_prompt_character(ch),
+                invisible.is_match(ch.encode_utf8(&mut bytes)),
+                "Unicode property mismatch at U+{:04X}",
+                ch as u32,
+            );
+        }
     }
 
     #[test]
