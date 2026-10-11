@@ -661,6 +661,21 @@ never blocks, and once the terminal `closed` or `failed` event has been
 drained it returns the `closed` error rather than `none`. Dropping the resource closes the socket and releases the
 connection lease.
 
+A refused `sockets` or `websocket` connect reaches the guest only as its typed
+error. The host also logs the same WARN record a refused `wasi:http` request
+produces, with `error_key` `plugin_egress_denied`: it names the instance
+(`plugin`, `capability`, `binding`), the `transport` (`http`, `socket`, or
+`websocket`), the requested host, and the reason. When the fix is a grant in
+`egress_hosts` or a private-address carve-out in `egress_allow_private`,
+`remedy` holds the exact `zeroclaw config set` command, carrying every entry
+the instance's grant already has; other refusals, such as a name that did not
+resolve, carry none. A connect refused because the instance's connection
+budget is spent logs `plugin_egress_connection_limit` instead. A TLS failure
+after the destination was authorized, such as a missing profile secret, is not
+an egress refusal and is not recorded this way. Every refused attempt is
+logged, so a plugin that retries should back off rather than reconnect in a
+tight loop.
+
 ### TLS profiles
 
 A `sockets` or `websocket` request may name a TLS profile the operator
@@ -672,6 +687,21 @@ the profile must also cover the host. Naming a profile on a plaintext
 connection is an invalid request. The properties a profile references are
 host-only: `secrets.get` returns `access-denied` for them, so the plugin never
 holds the private key it authenticates with.
+
+The host builds each connection's TLS configuration when that connection
+opens, from the configuration revision of the service frame that opens it, and
+the connection owns it. The frame's transient material is paired only with an
+authorization derived from matching canonical configuration inputs. If policy,
+profile references, or material changes between those views (including while
+DNS is pending), opening the connection fails closed rather than combining
+revisions. A later frame resolves rotated material; already-open connections
+are unchanged. Egress grants remain checked on each request, so a removed
+profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
+and a connection without a profile, use the roots plugin HTTPS trusts, which
+are read once per process. A connection that is already open keeps the
+identity it presented in its handshake until it is dropped or closed. Dropping
+it, or cancelling the call that is still opening it, releases the
+configuration together with the connection lease.
 
 ### Per-plugin config (`__config` and `config.get`)
 

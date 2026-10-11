@@ -9,6 +9,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/egress_records.rs"]
+mod egress_records;
 mod support;
 
 use std::collections::HashMap;
@@ -160,6 +162,11 @@ async fn plain_echo() -> u16 {
 
 /// Echo over TLS from the first byte.
 async fn tls_echo(acceptor: tokio_rustls::TlsAcceptor) -> u16 {
+    tls_echo_after(acceptor, std::time::Duration::ZERO).await
+}
+
+/// Echo over TLS from the first byte, holding each reply for `delay`.
+async fn tls_echo_after(acceptor: tokio_rustls::TlsAcceptor, delay: std::time::Duration) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     zeroclaw_spawn::spawn!(async move {
@@ -169,6 +176,9 @@ async fn tls_echo(acceptor: tokio_rustls::TlsAcceptor) -> u16 {
         };
         let mut bytes = [0_u8; 1024];
         while let Ok(count) = stream.read(&mut bytes).await {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if count == 0 || stream.write_all(&bytes[..count]).await.is_err() {
                 break;
             }
@@ -211,13 +221,20 @@ fn egress(hosts: &[&str], with_profile: bool) -> EgressHostService {
         if !with_profile {
             return Ok(policy);
         }
-        policy.with_tls_profiles([TlsProfile::new(
-            TlsProfileName::new("corp")?,
-            &["localhost".to_string()],
-            false,
-            Some(SecretPropertyRef::parse("ca_pem".to_string()).expect("ca_pem reference")),
-            None,
-        )?])
+        policy
+            .with_tls_profiles([TlsProfile::new(
+                TlsProfileName::new("corp")?,
+                &["localhost".to_string()],
+                false,
+                Some(SecretPropertyRef::parse("ca_pem".to_string()).expect("ca_pem reference")),
+                None,
+            )?])
+            .map(|policy| {
+                policy.with_tls_config_witness(
+                    // This fixture's policy and config are immutable for the invocation.
+                    zeroclaw_plugins::egress::TlsConfigWitness::new([0; 32]),
+                )
+            })
     }))
 }
 
@@ -257,7 +274,11 @@ async fn run(run: Run<'_>) -> Result<String, String> {
     let resolver_manifest = manifest.clone();
     let services = PluginHostServices::new(
         PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&resolver_manifest, scope, Some(&configured))
+            resolve_plugin_config(&resolver_manifest, scope, Some(&configured)).map(|config| {
+                config.with_tls_config_witness(zeroclaw_plugins::egress::TlsConfigWitness::new(
+                    [0; 32],
+                ))
+            })
         }),
         state_service(),
     );
@@ -347,6 +368,25 @@ async fn direct_tls_trusts_a_custom_ca_only_through_the_selected_profile() {
     assert_eq!(trusted.as_deref(), Ok("ping"));
 }
 
+/// A reply that arrives well after the request must still reach the guest.
+/// `receive` never blocks and every poll spends one of the frame's host calls,
+/// so a guest that polled without pausing would exhaust that budget first and
+/// fail with `host-unavailable`, whenever the round trip is slower than its
+/// spin.
+#[tokio::test]
+async fn direct_tls_waits_out_a_slow_peer() {
+    let pki = TestPki::new();
+    let port = tls_echo_after(pki.acceptor(), std::time::Duration::from_millis(250)).await;
+    let delayed = run(Run {
+        mode: "tls",
+        profile: Some("corp"),
+        ca_pem: Some(&pki.ca_pem),
+        ..plain(port, Some(egress(&["localhost"], true)))
+    })
+    .await;
+    assert_eq!(delayed.as_deref(), Ok("ping"));
+}
+
 #[tokio::test]
 async fn a_profile_is_refused_on_plaintext_and_when_unknown() {
     let port = plain_echo().await;
@@ -384,4 +424,48 @@ async fn starttls_negotiates_in_plaintext_then_upgrades_in_place() {
     })
     .await;
     assert_eq!(upgraded.as_deref(), Ok("ping"));
+}
+
+/// A refused connect is recorded for the operator, who otherwise sees nothing:
+/// the guest gets only `access-denied`. The record names the transport and,
+/// when a grant would help, the command that adds it while keeping the grant
+/// the instance already has.
+#[tokio::test]
+async fn a_refused_socket_is_recorded_for_the_operator() {
+    egress_records::start();
+    let port = plain_echo().await;
+    // The binding `run` derives for a plaintext run on this port.
+    let instance = format!("socket-plaintext-{port}");
+
+    run(plain(port, Some(egress(&["records.example.com"], false))))
+        .await
+        .expect_err("an ungranted destination must be refused");
+    let refused = egress_records::matching(|record| {
+        record["binding"] == instance.as_str() && record["remedy"].is_string()
+    });
+    assert_eq!(
+        refused.len(),
+        1,
+        "one refused connect, one record: {refused:?}"
+    );
+    assert_eq!(refused[0]["transport"], "socket");
+    assert_eq!(refused[0]["error_key"], "plugin_egress_denied");
+    assert_eq!(refused[0]["host"], "localhost");
+    let remedy = refused[0]["remedy"].as_str().unwrap_or_default();
+    assert!(
+        remedy.ends_with(".egress_hosts '[\"records.example.com\",\"localhost\"]'"),
+        "the remedy keeps the current grant: {remedy}"
+    );
+
+    run(plain(port, None))
+        .await
+        .expect_err("a store with no egress authority has no reach");
+    let unattached = egress_records::matching(|record| {
+        record["binding"] == instance.as_str() && record["remedy"].is_null()
+    });
+    assert_eq!(unattached.len(), 1, "{unattached:?}");
+    assert_eq!(
+        unattached[0]["reason"],
+        "no egress policy granted for this instance"
+    );
 }

@@ -9,6 +9,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+#[path = "support/egress_records.rs"]
+mod egress_records;
 mod support;
 
 use std::collections::HashMap;
@@ -152,25 +154,41 @@ async fn echo<S>(stream: S)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    echo_after(stream, std::time::Duration::ZERO).await;
+}
+
+/// As [`echo`], holding each reply for `delay`.
+async fn echo_after<S>(stream: S, delay: std::time::Duration)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
     while let Some(Ok(message)) = socket.next().await {
-        if let Message::Text(text) = message
-            && socket.send(Message::Text(text)).await.is_err()
-        {
-            break;
+        if let Message::Text(text) = message {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if socket.send(Message::Text(text)).await.is_err() {
+                break;
+            }
         }
     }
 }
 
 /// A `ws://` echo server for one connection.
 async fn ws_echo() -> u16 {
+    ws_echo_after(std::time::Duration::ZERO).await
+}
+
+/// A `ws://` echo server for one connection that holds each reply for `delay`.
+async fn ws_echo_after(delay: std::time::Duration) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     zeroclaw_spawn::spawn!(async move {
         let (stream, _) = listener.accept().await.expect("accept");
-        echo(stream).await;
+        echo_after(stream, delay).await;
     });
     port
 }
@@ -198,13 +216,20 @@ fn egress(hosts: &[&str], with_profile: bool) -> EgressHostService {
         if !with_profile {
             return Ok(policy);
         }
-        policy.with_tls_profiles([TlsProfile::new(
-            TlsProfileName::new("corp")?,
-            &["localhost".to_string()],
-            false,
-            Some(SecretPropertyRef::parse("ca_pem".to_string()).expect("ca_pem reference")),
-            None,
-        )?])
+        policy
+            .with_tls_profiles([TlsProfile::new(
+                TlsProfileName::new("corp")?,
+                &["localhost".to_string()],
+                false,
+                Some(SecretPropertyRef::parse("ca_pem".to_string()).expect("ca_pem reference")),
+                None,
+            )?])
+            .map(|policy| {
+                policy.with_tls_config_witness(
+                    // This fixture's policy and config are immutable for the invocation.
+                    zeroclaw_plugins::egress::TlsConfigWitness::new([0; 32]),
+                )
+            })
     }))
 }
 
@@ -216,6 +241,12 @@ struct Run<'a> {
     egress: Option<EgressHostService>,
 }
 
+/// The instance binding a run against `url` uses. Unique per url so the
+/// process-wide connection budget never couples concurrently running tests.
+fn binding(url: &str) -> String {
+    format!("websocket-{}", url.replace(['/', ':', '.'], "-"))
+}
+
 /// Instantiate the compiled fixture under one scope and run it once.
 async fn run(run: Run<'_>) -> Result<String, String> {
     let manifest = manifest();
@@ -223,9 +254,7 @@ async fn run(run: Run<'_>) -> Result<String, String> {
     if run.grant_websocket {
         grants.push(PluginPermission::WebSocketClient);
     }
-    // Unique per call so the process-wide connection budget never couples
-    // concurrently running tests.
-    let binding = format!("websocket-{}", run.url.replace(['/', ':', '.'], "-"));
+    let binding = binding(&run.url);
     let scope =
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Tool, &binding, grants)
             .expect("admit fixture scope");
@@ -239,7 +268,11 @@ async fn run(run: Run<'_>) -> Result<String, String> {
     let resolver_manifest = manifest.clone();
     let services = PluginHostServices::new(
         PluginConfigResolver::new(move |scope| {
-            resolve_plugin_config(&resolver_manifest, scope, Some(&configured))
+            resolve_plugin_config(&resolver_manifest, scope, Some(&configured)).map(|config| {
+                config.with_tls_config_witness(zeroclaw_plugins::egress::TlsConfigWitness::new(
+                    [0; 32],
+                ))
+            })
         }),
         state_service(),
     );
@@ -270,6 +303,17 @@ async fn ws_reaches_a_granted_destination_without_a_plaintext_exception() {
     let port = ws_echo().await;
     let output = run(ws(port, Some(egress(&["localhost"], false)))).await;
     assert_eq!(output.as_deref(), Ok("ping"));
+}
+
+/// A reply that arrives well after the request must still reach the guest.
+/// `receive` never blocks and every poll spends one of the frame's host calls,
+/// so a guest that polled without pausing would exhaust that budget first and
+/// fail with `unavailable`, whenever the round trip is slower than its spin.
+#[tokio::test]
+async fn ws_waits_out_a_slow_peer() {
+    let port = ws_echo_after(std::time::Duration::from_millis(250)).await;
+    let delayed = run(ws(port, Some(egress(&["localhost"], false)))).await;
+    assert_eq!(delayed.as_deref(), Ok("ping"));
 }
 
 #[tokio::test]
@@ -323,4 +367,48 @@ async fn wss_trusts_a_custom_ca_only_through_the_selected_profile() {
     })
     .await;
     assert_eq!(trusted.as_deref(), Ok("ping"));
+}
+
+/// A refused connect is recorded for the operator, who otherwise sees nothing:
+/// the guest gets only `destination-denied`. The record names the transport
+/// and, when a grant would help, the command that adds it while keeping the
+/// grant the instance already has.
+#[tokio::test]
+async fn a_refused_websocket_is_recorded_for_the_operator() {
+    egress_records::start();
+    let port = ws_echo().await;
+    let target = ws(port, Some(egress(&["records.example.com"], false)));
+    let instance = binding(&target.url);
+
+    run(target)
+        .await
+        .expect_err("an ungranted destination must be refused");
+    let refused = egress_records::matching(|record| {
+        record["binding"] == instance.as_str() && record["remedy"].is_string()
+    });
+    assert_eq!(
+        refused.len(),
+        1,
+        "one refused connect, one record: {refused:?}"
+    );
+    assert_eq!(refused[0]["transport"], "websocket");
+    assert_eq!(refused[0]["error_key"], "plugin_egress_denied");
+    assert_eq!(refused[0]["host"], "localhost");
+    let remedy = refused[0]["remedy"].as_str().unwrap_or_default();
+    assert!(
+        remedy.ends_with(".egress_hosts '[\"records.example.com\",\"localhost\"]'"),
+        "the remedy keeps the current grant: {remedy}"
+    );
+
+    run(ws(port, None))
+        .await
+        .expect_err("a store with no egress authority has no reach");
+    let unattached = egress_records::matching(|record| {
+        record["binding"] == instance.as_str() && record["remedy"].is_null()
+    });
+    assert_eq!(unattached.len(), 1, "{unattached:?}");
+    assert_eq!(
+        unattached[0]["reason"],
+        "no egress policy granted for this instance"
+    );
 }
