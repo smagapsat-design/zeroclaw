@@ -79,10 +79,13 @@ key and its generation. Deletion matches these bound values, not a normalized
 version of the abort lookup key: dotted and underscored WebSocket session IDs
 can identify distinct queues. HTTP/SSE registration retains its actual
 normalized queue key while preserving the raw ID used by the abort endpoint.
-The Rust registry's map value is `GatewayCancellationEntry` rather than a
-`(generation, token)` tuple; direct consumers use its `session_key`,
-`generation`, and `token` fields. Wire, configuration and stored-session formats
-are unchanged.
+The Rust `AppState::cancel_tokens` field changes from
+`Arc<Mutex<HashMap<String, Arc<CancellationToken>>>>` to
+`Arc<Mutex<GatewayCancellationRegistry>>`. Direct constructors use the registry
+instead of a plain map; its map values are `GatewayCancellationEntry`, with
+`session_key`, `generation`, and `token` fields. Registration and deletion
+helpers carry the admitted queue key and generation. Wire, configuration and
+stored-session formats are unchanged.
 
 ## Reload and restart
 
