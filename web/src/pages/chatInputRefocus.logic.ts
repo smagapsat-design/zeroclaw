@@ -38,13 +38,20 @@ export function nextChatInputRefocus(state: ChatInputRefocusState): ChatInputRef
  * Classifies `document.activeElement`. Browsers move focus off a control that
  * becomes disabled either to the body or (Firefox) leave it on the disabled
  * control, so both count as "the user has not focused anything else".
+ *
+ * `composerAction` is the composer's own Stop/Send button. It is one `<button>`
+ * that shows Stop while a turn runs and turns into Send when it ends, so after
+ * the user presses Stop the focus is still on it when the turn ends. That is
+ * the composer, not another control, so it counts as "nothing".
  */
 export function chatInputFocusOwner(
   activeElement: unknown,
   body: unknown,
   input: unknown,
+  composerAction: unknown = null,
 ): ChatInputFocusOwner {
   if (activeElement === input) return 'input';
   if (activeElement == null || activeElement === body) return 'nothing';
+  if (composerAction != null && activeElement === composerAction) return 'nothing';
   return 'other';
 }

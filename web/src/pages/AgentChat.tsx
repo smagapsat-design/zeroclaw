@@ -212,6 +212,7 @@ export function AgentChatInner({
   // handleSend gave it. Give it back when the turn ends, unless this pane is
   // hidden or the user focused something else meanwhile.
   const refocusArmedRef = useRef(false);
+  const composerActionRef = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     const el = inputRef.current;
     const action = nextChatInputRefocus({
@@ -219,7 +220,12 @@ export function AgentChatInner({
       typing,
       inputEnabled: connected && hydrated,
       inputVisible: el !== null && el.getClientRects().length > 0,
-      focusOwner: chatInputFocusOwner(document.activeElement, document.body, el),
+      focusOwner: chatInputFocusOwner(
+        document.activeElement,
+        document.body,
+        el,
+        composerActionRef.current?.querySelector('button') ?? null,
+      ),
     });
     if (action === 'arm') refocusArmedRef.current = true;
     if (action === 'focus' || action === 'skip') refocusArmedRef.current = false;
@@ -823,6 +829,9 @@ export function AgentChatInner({
             className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
             style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
           />
+          {/* Stop and Send render as the same <button>; the refocus effect
+              reads it here so pressing Stop still returns focus to the box. */}
+          <span ref={composerActionRef} className="contents">
           {typing ? (
             <Button
               variant="danger"
@@ -846,6 +855,7 @@ export function AgentChatInner({
               <Send className="h-4 w-4" />
             </Button>
           )}
+          </span>
         </div>
         <div className="flex items-center justify-between mt-2 gap-2 max-w-4xl mx-auto">
           <div className="flex items-center gap-2">

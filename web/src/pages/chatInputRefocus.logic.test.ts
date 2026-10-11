@@ -50,3 +50,17 @@ test('focus owner classification', () => {
   assert.equal(chatInputFocusOwner(input, body, input), 'input');
   assert.equal(chatInputFocusOwner(button, body, input), 'other');
 });
+
+test('the Stop button the user pressed does not count as another control', () => {
+  const body = {};
+  const input = {};
+  const stop = {};
+  const other = {};
+  assert.equal(chatInputFocusOwner(stop, body, input, stop), 'nothing');
+  assert.equal(chatInputFocusOwner(other, body, input, stop), 'other');
+  assert.equal(chatInputFocusOwner(input, body, input, stop), 'input');
+  assert.equal(
+    nextChatInputRefocus({ ...ended, focusOwner: chatInputFocusOwner(stop, body, input, stop) }),
+    'focus',
+  );
+});

@@ -299,7 +299,7 @@ async function mountChat(
             scrollHeight: 24,
             getClientRects: () => (composerVisible ? [{}] : []),
           }
-          : { focus: () => {}, scrollIntoView: () => {}, contains: () => false },
+          : { focus: () => {}, scrollIntoView: () => {}, contains: () => false, querySelector: () => null },
       },
     );
     await Promise.resolve();
